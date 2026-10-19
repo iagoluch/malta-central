@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>malta-central · Motorola E7 Power</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #121826; --panel2: #0e1420;
+    --border: #1d2740; --txt: #dbe4f3; --dim: #7b8aa5;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --acc: #38bdf8; --vib: #a78bfa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--txt); font: 14px/1.5 "Segoe UI", Roboto, sans-serif; padding: 18px; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 20px; letter-spacing: .5px; }
+  header h1 span { color: var(--acc); }
+  .pill { padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.on  { background: #052e1d; color: var(--ok); border: 1px solid var(--ok); }
+  .pill.off { background: #2b0b0b; color: var(--err); border: 1px solid var(--err); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--dim); margin-bottom: 12px; }
+  .big { font-size: 34px; font-weight: 700; }
+  .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
+  .kv { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+  .kv:last-child { border-bottom: none; }
+  .kv b { color: var(--txt); font-weight: 600; }
+  .kv span { color: var(--dim); }
+  .bar { height: 9px; background: var(--panel2); border-radius: 5px; overflow: hidden; margin: 8px 0; }
+  .bar > div { height: 100%; background: var(--acc); border-radius: 5px; transition: width .4s; }
+  .bar.ok > div { background: var(--ok); }
+  .bar.warn > div { background: var(--warn); }
+  canvas { width: 100%; height: 90px; margin-top: 8px; }
+  .netrow { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .dot.up { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.down { background: var(--err); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .btn { background: var(--panel2); color: var(--txt); border: 1px solid var(--border); border-radius: 9px; padding: 8px 14px; font-size: 13px; cursor: pointer; transition: .15s; }
+  .btn:hover { border-color: var(--acc); color: var(--acc); }
+  .btn.danger:hover { border-color: var(--err); color: var(--err); }
+  .term { grid-column: 1 / -1; background: #05070c; border: 1px solid var(--border); border-radius: 14px; padding: 14px; }
+  .term-out { background: #000; border-radius: 9px; padding: 12px; height: 300px; overflow-y: auto; font: 12.5px/1.55 "JetBrains Mono", Consolas, monospace; color: #9fe8b8; white-space: pre-wrap; word-break: break-all; }
+  .term-in { display: flex; gap: 8px; margin-top: 10px; }
+  .term-in input { flex: 1; background: var(--panel2); border: 1px solid var(--border); color: var(--txt); border-radius: 9px; padding: 10px 12px; font: 13px "JetBrains Mono", monospace; outline: none; }
+  .term-in input:focus { border-color: var(--acc); }
+  .term-in button { padding: 0 22px; }
+  footer { margin-top: 14px; color: var(--dim); font-size: 11.5px; text-align: center; }
+  .flash { position: fixed; right: 18px; bottom: 18px; background: var(--panel); border: 1px solid var(--acc); color: var(--acc); padding: 10px 16px; border-radius: 10px; opacity: 0; transition: .3s; font-size: 13px; pointer-events: none; }
+  .flash.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📱 malta<span>-central</span></h1>
+  <span class="pill off" id="status-pill">offline</span>
+  <span style="color:var(--dim);font-size:12px" id="port-label">procurando /dev/ttyACM*…</span>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>🔋 Bateria</h2>
+    <div class="big" id="volt">—</div>
+    <div class="sub" id="volt-sub">aguardando…</div>
+    <canvas id="chart" width="600" height="90"></canvas>
+    <div class="kv"><span>Corrente</span><b id="curr">—</b></div>
+    <div class="kv"><span>Temperatura</span><b id="temp">—</b></div>
+    <div class="kv"><span>Estado</span><b id="chg">—</b></div>
+  </div>
+
+  <div class="card">
+    <h2>⚙️ Sistema</h2>
+    <div class="kv"><span>Kernel</span><b id="kernel">—</b></div>
+    <div class="kv"><span>Uptime</span><b id="uptime">—</b></div>
+    <div class="kv"><span>Load (1min)</span><b id="load">—</b></div>
+    <div class="kv"><span>Memória</span><b id="mem">—</b></div>
+    <div class="bar" id="membar"><div style="width:0%"></div></div>
+    <div class="kv"><span>Partições eMMC</span><b id="mmc">—</b></div>
+  </div>
+
+  <div class="card">
+    <h2>💾 Persistência (/data)</h2>
+    <div id="data-state" style="margin-bottom:8px">—</div>
+    <div class="bar" id="databar"><div style="width:0%"></div></div>
+    <div class="kv"><span>Dispositivo</span><b id="data-dev">—</b></div>
+    <div class="kv"><span>Usado</span><b id="data-used">—</b></div>
+    <div class="kv"><span>Livre</span><b id="data-free">—</b></div>
+  </div>
+
+  <div class="card">
+    <h2>🌐 Rede</h2>
+    <div id="netlist"><div class="sub">aguardando…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>🎛️ Ações</h2>
+    <div class="actions">
+      <button class="btn" onclick="action('mmc')">Trigger mmc (montar /data)</button>
+      <button class="btn" onclick="action('net')">Trigger net (ccmni)</button>
+      <button class="btn" onclick="action('fb')">Trigger fb (tela)</button>
+      <button class="btn" onclick="action('dmesg')">dmesg (tail 40)</button>
+      <button class="btn danger" onclick="reboot()">⟳ Reboot</button>
+    </div>
+    <div class="sub" style="margin-top:10px">Triggers ativam os blocos dormantes do init no celular.</div>
+  </div>
+
+  <div class="term">
+    <h2 style="font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px">⌨️ Terminal remoto (shell root do celular)</h2>
+    <div class="term-out" id="term-out">malta-central terminal — digite comandos e Enter. Ex.: uptime, df -h /data, ip link\n</div>
+    <div class="term-in">
+      <input id="term-inp" placeholder="comando…" autocomplete="off" spellcheck="false">
+      <button class="btn" onclick="sendterm()">run</button>
+    </div>
+  </div>
+</div>
+
+<footer>malta-central · Alpine Linux 3.24 · kernel stock 4.9.190 · Moto E7 Power XT2097-5</footer>
+<div class="flash" id="flash"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let hist = [];
+
+function fmtUptime(s) {
+  if (s == null) return '—';
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+  return h ? `${h}h ${m}min` : `${m}min ${Math.floor(s%60)}s`;
+}
+
+function drawChart() {
+  const c = $('chart'), ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (hist.length < 2) return;
+  const vs = hist.map(h => h.v).filter(v => v != null);
+  if (!vs.length) return;
+  const min = Math.min(...vs) - 0.02, max = Math.max(...vs) + 0.02;
+  const X = i => i / (hist.length - 1) * c.width;
+  const Y = v => c.height - (v - min) / (max - min) * (c.height - 12) - 6;
+  // grade
+  ctx.strokeStyle = '#1d2740'; ctx.lineWidth = 1;
+  for (let g = 1; g < 4; g++) { ctx.beginPath(); ctx.moveTo(0, g*c.height/4); ctx.lineTo(c.width, g*c.height/4); ctx.stroke(); }
+  // linha de tensão
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2; ctx.beginPath();
+  let started = false;
+  hist.forEach((h, i) => { if (h.v == null) return; const x = X(i), y = Y(h.v); started ? ctx.lineTo(x,y) : ctx.moveTo(x,y); started = true; });
+  ctx.stroke();
+  // área sob a curva
+  ctx.lineTo(c.width, c.height); ctx.lineTo(0, c.height); ctx.closePath();
+  ctx.fillStyle = 'rgba(56,189,248,.08)'; ctx.fill();
+  ctx.fillStyle = '#7b8aa5'; ctx.font = '10px sans-serif';
+  ctx.fillText((max/1000).toFixed(2)+'V', 4, 12); ctx.fillText((min/1000).toFixed(2)+'V', 4, c.height-4);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/status');
+    const st = await r.json();
+    const pill = $('status-pill');
+    if (st.online) {
+      pill.className = 'pill on'; pill.textContent = 'online';
+      $('port-label').textContent = st.port + ' · 115200 baud';
+      $('volt').textContent = st.voltage_mv != null ? (st.voltage_mv/1000).toFixed(2) + ' V' : '—';
+      $('volt-sub').textContent = 'tensão da bateria';
+      const i = st.current_ma ?? 0;
+      $('curr').textContent = (i > 0 ? '+' : '') + i + ' mA';
+      $('temp').textContent = st.batt_temp != null ? st.batt_temp + ' °C' : '—';
+      const chg = i > 0 ? 'carregando ⚡' : (i < 0 ? 'descarregando' : 'repouso');
+      $('chg').textContent = chg;
+      $('chg').style.color = i > 0 ? 'var(--ok)' : 'var(--txt)';
+      $('kernel').textContent = st.kernel;
+      $('uptime').textContent = fmtUptime(st.uptime_s);
+      $('load').textContent = st.load1 ?? '—';
+      if (st.mem_total_kb) {
+        const used = st.mem_total_kb - (st.mem_avail_kb || 0);
+        const pct = Math.round(used / st.mem_total_kb * 100);
+        $('mem').textContent = `${(used/1024).toFixed(0)} MB / ${(st.mem_total_kb/1024).toFixed(0)} MB (${pct}%)`;
+        const mb = $('membar'); mb.className = 'bar' + (pct > 85 ? ' warn' : ' ok');
+        mb.firstElementChild.style.width = pct + '%';
+      }
+      $('mmc').textContent = st.mmc_parts ?? '—';
+      // /data
+      if (st.data_mounted && st.data) {
+        $('data-state').innerHTML = '✅ montado (f2fs)';
+        $('data-state').style.color = 'var(--ok)';
+        $('databar').firstElementChild.style.width = st.data.pct + '%';
+        $('databar').className = 'bar' + (st.data.pct > 90 ? ' warn' : ' ok');
+        $('data-dev').textContent = st.data.device;
+        $('data-used').textContent = `${st.data.used_mb} MB (${st.data.pct}%)`;
+        $('data-free').textContent = st.data.free_mb + ' MB';
+      } else {
+        $('data-state').innerHTML = '⛔ não montado — use o trigger mmc';
+        $('data-state').style.color = 'var(--err)';
+        $('data-dev').textContent = '/dev/mmcblk0p60 (aguardando)';
+        $('data-used').textContent = '—'; $('data-free').textContent = '—';
+        $('databar').firstElementChild.style.width = '0%';
+      }
+      // rede
+      const nets = Object.entries(st.net || {});
+      $('netlist').innerHTML = nets.length
+        ? nets.map(([n, s]) => `<div class="netrow"><span class="dot ${s === 'up' ? 'up' : 'down'}"></span>${n} <span style="color:var(--dim)">${s}</span></div>`).join('')
+        : '<div class="sub">sem interfaces</div>';
+      hist = st.history || [];
+      drawChart();
+    } else {
+      pill.className = 'pill off'; pill.textContent = 'offline';
+      $('port-label').textContent = 'celular não encontrado no USB';
+    }
+  } catch (e) { /* server fora */ }
+}
+
+async function api(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+    return await r.json();
+  } catch (e) { return { ok: false, output: 'erro de rede: ' + e }; }
+}
+
+function termOut(text, cls) {
+  const el = $('term-out');
+  el.textContent += (cls ? `\n[malta-central ${cls}]\n` : '\n') + text + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+async function sendterm() {
+  const inp = $('term-inp'); const cmd = inp.value.trim();
+  if (!cmd) return;
+  inp.value = '';
+  termOut(`~ # ${cmd}`, null);
+  const r = await api('/api/cmd', { cmd });
+  termOut(r.ok ? r.output : `ERRO: ${r.output}`, r.ok ? null : 'err');
+}
+
+async function action(a) {
+  flash(a + '…');
+  const r = await api('/api/action', { action: a });
+  termOut(`[ação ${a}]\n` + (r.output || '(ok)'), null);
+  flash(r.ok ? '✅ ' + a : '❌ falhou');
+}
+
+function reboot() {
+  if (!confirm('Rebootar o celular? (volta sozinho — init v16c2 boota normal)')) return;
+  action('reboot');
+  flash('reboot enviado — aguarde ~15s e o serial volta');
+}
+
+let flashTimer;
+function flash(msg) {
+  const f = $('flash'); f.textContent = msg; f.classList.add('show');
+  clearTimeout(flashTimer); flashTimer = setTimeout(() => f.classList.remove('show'), 2500);
+}
+
+$('term-inp').addEventListener('keydown', e => { if (e.key === 'Enter') sendterm(); });
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
