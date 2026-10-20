@@ -204,7 +204,7 @@ async function refresh() {
       drawChart();
     } else {
       pill.className = 'pill off'; pill.textContent = 'offline';
-      $('port-label').textContent = 'celular não encontrado no USB';
+      $('port-label').textContent = 'aguardando celular… (reconecta sozinho quando o cabo volta)';
     }
   } catch (e) { /* server fora */ }
 }

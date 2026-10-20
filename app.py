@@ -23,6 +23,8 @@ import glob
 
 from flask import Flask, jsonify, request, render_template
 
+import termios
+
 try:
     import serial
     import serial.tools.list_ports
@@ -32,16 +34,21 @@ except ImportError:
 BAUD = 115200
 MARKER = "__MC%d_DONE__"
 PORT_CANDIDATES = ["/dev/ttyACM0", "/dev/ttyACM1"]
+# erros possíveis de uma porta serial morta/meio-aberta
+SERIAL_ERRORS = (serial.SerialException, OSError, termios.error)
 
 app = Flask(__name__)
 
 
 class MaltaSerial:
-    """Cliente do console serial do malta.
+    """Cliente do console serial do malta — com RECONEXÃO AUTOMÁTICA.
 
-    Protocolo: envia  <cmd>; echo <marker>
-    Lê até aparecer o marker; devolve o output limpo.
-    Um lock serializa o acesso (uma requisição por vez).
+    Sobrevive a desconectar/reconectar o cabo USB:
+      * a porta antiga some (/dev/ttyACM0 desaparece) → detectado a cada comando;
+      * handle morto (write/read falha) → fecha e reabre;
+      * o device pode voltar como ttyACM0 OU ttyACM1 → re-detecta sempre.
+
+    Protocolo: envia  <cmd>; echo <marker>  e lê até o marcador.
     """
 
     def __init__(self):
@@ -50,72 +57,106 @@ class MaltaSerial:
         self.port = None
         self._marker_seq = 0
 
-    # ---------- conexão ----------
+    # ---------- detecção / conexão ----------
     def detect_port(self):
         for c in PORT_CANDIDATES:
             if os.path.exists(c):
                 return c
-        return None
+        # varredura extra: udev pode recriar com nome diferente
+        try:
+            return sorted(glob.glob("/dev/ttyACM*"))[0]
+        except IndexError:
+            return None
+
+    def _port_alive(self):
+        """Handle aberto aponta pra uma porta que ainda existe?"""
+        return (
+            self.ser is not None
+            and self.ser.is_open
+            and self.port is not None
+            and os.path.exists(self.port)
+        )
 
     def connect(self):
-        if self.ser is not None and self.ser.is_open:
+        # cabo foi desconetado/reconectado? handle antigo morreu → descarta
+        if self.ser is not None and self.ser.is_open and not os.path.exists(self.port or ""):
+            self.disconnect()
+        if self._port_alive():
             return True
-        port = self.detect_port()
-        if not port:
-            return False
-        try:
-            self.ser = serial.Serial(port, BAUD, timeout=1)
-            self.port = port
-            # acordar o shell (newline) e limpar o buffer
-            self.ser.reset_input_buffer()
-            self.ser.write(b"\n")
-            time.sleep(0.3)
-            self.ser.reset_input_buffer()
-            return True
-        except serial.SerialException:
-            self.ser = None
-            return False
+        self.disconnect()
+        # (re)detecta e abre com retries — cobre a janela em que udev
+        # ainda está recriando o node após o replug
+        for _ in range(5):
+            port = self.detect_port()
+            if port:
+                try:
+                    self.ser = serial.Serial(port, BAUD, timeout=1)
+                    self.port = port
+                    self.ser.reset_input_buffer()
+                    self.ser.write(b"\n")           # acorda o shell
+                    time.sleep(0.4)
+                    self.ser.reset_input_buffer()  # descarta lixo do replug
+                    return True
+                except SERIAL_ERRORS:
+                    self.disconnect()
+            time.sleep(0.4)
+        return False
 
     def disconnect(self):
-        if self.ser and self.ser.is_open:
+        if self.ser is not None:
             try:
-                self.ser.close()
+                if self.ser.is_open:
+                    self.ser.close()
             except Exception:
                 pass
         self.ser = None
+        self.port = None
 
     # ---------- comando ----------
-    def run(self, cmd, timeout=8.0):
-        """Executa um comando no shell do celular e devolve (ok, output)."""
-        with self.lock:
-            if not self.connect():
-                return False, "serial indisponível — celular conectado?"
-            self._marker_seq += 1
-            marker = (MARKER % self._marker_seq).encode()
-            payload = f"{cmd}; echo {marker.decode()}\n".encode()
+    def _attempt(self, cmd, timeout):
+        """Uma tentativa: assume conectado, devolve (ok, output, fatal)."""
+        if not self.connect():
+            return False, "serial indisponível — celular conectado?"
+        self._marker_seq += 1
+        marker = (MARKER % self._marker_seq).encode()
+        payload = f"{cmd}; echo {marker.decode()}\n".encode()
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(payload)
+            self.ser.flush()
+        except SERIAL_ERRORS:
+            self.disconnect()
+            return False, "porta serial morreu", True   # fatal → reconectar
+
+        buf = b""
+        deadline = time.time() + timeout
+        got_any = False
+        while time.time() < deadline:
             try:
-                self.ser.reset_input_buffer()
-                self.ser.write(payload)
-                self.ser.flush()
-            except serial.SerialException:
-                self.disconnect()
-                return False, "porta serial morreu — reconecte o celular"
-
-            buf = b""
-            deadline = time.time() + timeout
-            while time.time() < deadline:
                 chunk = self.ser.read(4096)
-                if chunk:
-                    buf += chunk
-                    if marker in buf:
-                        break
+            except SERIAL_ERRORS:
+                self.disconnect()
+                return False, "porta serial morreu", True
+            if chunk:
+                got_any = True
+                buf += chunk
                 if marker in buf:
-                    break
-            else:
-                return False, "timeout aguardando resposta do celular"
+                    return True, self._clean(buf, payload, marker), False
+        # timeout: se NADA chegou, a conexão provavelmente caiu (cabo fora)
+        if not got_any:
+            self.disconnect()
+            return False, "sem resposta — reconectando", True
+        return False, "timeout aguardando marcador", False
 
-            out = self._clean(buf, payload, marker)
-            return True, out
+    def run(self, cmd, timeout=8.0):
+        """Executa no celular; reconecta sozinho após replug do cabo."""
+        with self.lock:
+            ok, out, fatal = self._attempt(cmd, timeout)
+            if not ok and fatal:
+                # cabo reconectado / handle morreu: reconecta e tenta de novo
+                time.sleep(0.3)
+                ok, out, fatal = self._attempt(cmd, timeout)
+            return ok, out
 
     def _clean(self, raw, payload, marker):
         try:

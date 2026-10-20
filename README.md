@@ -41,8 +41,9 @@ Requisitos do lado do celular (o "malta Linux"):
 - Shell root interativo no gadget serial (`ttyGS0` → `/dev/ttyACM0` no PC)
 - init com blocos dormantes acionáveis via `/tmp/GO` ( mmc | fb | net )
 
-O app **auto-detecta** `/dev/ttyACM0` ou `/dev/ttyACM1` a cada comando — pode espetar e
-desespetar o cabo que ele reconecta sozinho.
+O app **auto-detecta** `/dev/ttyACM0` ou `/dev/ttyACM1` e **reconecta sozinho** quando o cabo
+USB é desconectado/reconectado — sem reiniciar nada: no máximo um ciclo de polling (3s) depois
+do replug o painel volta ao vivo. Também sobrevive ao celular rebootar (o serial volta com ele).
 
 ## Arquitetura
 
