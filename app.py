@@ -29,11 +29,14 @@ import base64
 import json
 import os
 import re
+import stat
 import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -42,27 +45,125 @@ try:
 except ImportError:  # pragma: no cover - dependência de runtime
     sys.exit("pyserial ausente: rode `pip install -r requirements.txt`")
 
-VERSION = "2.0.0"
+import malta_ai
+import malta_catalog
+import malta_diagnostics
+import malta_files
+
+VERSION = "3.0.0"
 BAUD = 115200
 MARKER = "__MC%d_DONE__"
+EXIT_TOKEN = "__MCXI"
 PORT_CANDIDATES = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2"]
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR / "settings.json"
-UPLOAD_LIMIT = 32 * 1024
-DOWNLOAD_LIMIT = 16 * 1024
+AI_SETTINGS_PATH = BASE_DIR / "ai.json"
+AI_KEY_PATH = BASE_DIR / "ai.key"
+CATALOG_PATH = BASE_DIR / "catalog.local.json"
+# Limites efetivos vêm de malta_files.parse_limits(SETTINGS), com teto rígido.
+MAX_BODY = 2 * 1024 * 1024
 
 DEFAULT_SETTINGS = {
     "auto_provision": True,
     "auto_mount_data": True,
     "poll_interval": 2.5,
     "theme": "dark",
+    "transfer_upload_kb": 32,
+    "transfer_download_kb": 16,
+    "editor_kb": 24,
 }
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
+app.config["MAX_CONTENT_LENGTH"] = MAX_BODY
+
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _hostname(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return urlsplit("//" + value).hostname
+    except ValueError:
+        return None
+
+
+def _host_allowed(value: str | None) -> bool:
+    name = _hostname(value)
+    if not name:
+        return False
+    name = name.lower()
+    if name in LOCAL_HOSTS:
+        return True
+    extra = {
+        item.strip().lower()
+        for item in os.environ.get("MC_ALLOWED_HOSTS", "").split(",")
+        if item.strip()
+    }
+    return name in extra
+
+
+@app.before_request
+def guard_local_access():
+    """Defesa contra DNS rebinding e formulários de outra origem.
+
+    O servidor já escuta apenas em 127.0.0.1; esta checagem impede que um
+    nome DNS apontado para loopback seja aceito, e rejeita POSTs de outra
+    origem. Para usar outro host local, defina MC_ALLOWED_HOSTS.
+    """
+    if not _host_allowed(request.host):
+        return jsonify({
+            "ok": False,
+            "error": "host não permitido",
+            "code": "host_not_allowed",
+        }), 400
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("Origin")
+        if origin:
+            try:
+                origin_host = urlsplit(origin).netloc
+            except ValueError:
+                origin_host = ""
+            if origin == "null" or not _host_allowed(origin_host):
+                return jsonify({
+                    "ok": False,
+                    "error": "origem não permitida",
+                    "code": "origin_not_allowed",
+                }), 403
+    return None
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    )
+    if request.path.startswith("/api/") or request.path == "/":
+        response.headers["Cache-Control"] = "no-store"
+    else:
+        response.headers.setdefault("Cache-Control", "no-cache")
+    return response
+
+
+@app.errorhandler(413)
+def request_too_large(_exc):
+    return jsonify({
+        "ok": False,
+        "error": f"corpo da requisição excede {MAX_BODY} bytes",
+        "code": "request_too_large",
+    }), 413
+
 
 APP_START = time.time()
 SETTINGS_LOCK = threading.Lock()
+AI_LOCK = threading.Lock()
 EVENTS_LOCK = threading.Lock()
 EVENTS = deque(maxlen=400)
 STATUS_LOCK = threading.Lock()
@@ -92,10 +193,10 @@ def log_event(msg: str, level: str = "info") -> None:
 # ---------------------------------------------------------------------------
 # Configurações persistentes
 # ---------------------------------------------------------------------------
-def load_settings(path: Path | str = SETTINGS_PATH) -> dict:
+def load_settings(path: Path | str | None = None) -> dict:
     data = dict(DEFAULT_SETTINGS)
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = json.loads(Path(path or SETTINGS_PATH).read_text(encoding="utf-8"))
     except Exception:
         return data
     if not isinstance(raw, dict):
@@ -112,10 +213,28 @@ def load_settings(path: Path | str = SETTINGS_PATH) -> dict:
         pass
     if raw.get("theme") in ("dark", "light"):
         data["theme"] = raw["theme"]
+    for key, default, maximum in (
+        ("transfer_upload_kb", 32, 64),
+        ("transfer_download_kb", 16, 48),
+        ("editor_kb", 24, 64),
+    ):
+        try:
+            number = int(float(raw.get(key, default)))
+        except (TypeError, ValueError):
+            number = default
+        data[key] = max(1, min(maximum, number))
     return data
 
 
-def save_settings(data: dict, path: Path | str = SETTINGS_PATH) -> dict:
+def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def save_settings(data: dict, path: Path | str | None = None) -> dict:
     clean = dict(DEFAULT_SETTINGS)
     clean["auto_provision"] = bool(data.get("auto_provision", True))
     clean["auto_mount_data"] = bool(data.get("auto_mount_data", True))
@@ -125,14 +244,146 @@ def save_settings(data: dict, path: Path | str = SETTINGS_PATH) -> dict:
         poll = 2.5
     clean["poll_interval"] = round(min(10.0, max(1.0, poll)), 1)
     clean["theme"] = data.get("theme") if data.get("theme") in ("dark", "light") else "dark"
-    target = Path(path)
+    clean["transfer_upload_kb"] = _bounded_int(data.get("transfer_upload_kb"), 32, 1, 64)
+    clean["transfer_download_kb"] = _bounded_int(data.get("transfer_download_kb"), 16, 1, 48)
+    clean["editor_kb"] = _bounded_int(data.get("editor_kb"), 24, 1, 64)
+    target = Path(path or SETTINGS_PATH)
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(json.dumps(clean, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(target)
     return clean
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Escrita atômica com modo 600; não segue link simbólico no temporário."""
+    target = Path(path)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError):
+            pass
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with fh:
+            fh.write(text)
+        tmp.replace(target)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_ai_settings(path: Path | str | None = None) -> dict:
+    """Lê ai.json sem seguir symlink; ausente ou inválido cai no ambiente."""
+    target = Path(path or AI_SETTINGS_PATH)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(target, flags)
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 8192:
+            return {}
+        raw = os.read(fd, 8193)
+    except OSError:
+        return {}
+    finally:
+        os.close(fd)
+    if len(raw) > 8192:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    try:
+        return malta_ai.validate_config(data)
+    except malta_ai.AiError:
+        return {}
+
+
+def save_ai_settings(data: dict, path: Path | str | None = None) -> dict:
+    clean = malta_ai.validate_config(data)
+    _write_private(
+        Path(path or AI_SETTINGS_PATH),
+        json.dumps(clean, indent=2, ensure_ascii=False) + "\n",
+    )
+    return clean
+
+
+def read_ai_key(path: Path | str | None = None) -> tuple[str, str]:
+    """Lê a chave HTTP local sem seguir symlink e corrige modo frouxo."""
+    target = Path(path or AI_KEY_PATH)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(target, flags)
+    except FileNotFoundError:
+        return "", ""
+    except OSError:
+        return "", "não foi possível ler a chave do PC"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "", "a chave do PC não é um arquivo regular"
+        data = os.read(fd, 4097)
+        if info.st_mode & 0o077:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        return "", "não foi possível ler a chave do PC"
+    finally:
+        os.close(fd)
+    if len(data) > 4096:
+        return "", "chave do PC grande demais"
+    value = data.decode("utf-8", "replace").strip()
+    if not value:
+        return "", "chave do PC vazia"
+    try:
+        value = malta_ai.validate_http_key(value)
+    except malta_ai.AiError as exc:
+        return "", str(exc)
+    return value, ""
+
+
+def write_ai_key(key, path: Path | str | None = None) -> None:
+    value = malta_ai.validate_http_key(key)
+    _write_private(Path(path or AI_KEY_PATH), value + "\n")
+
+
+def remove_ai_key(path: Path | str | None = None) -> None:
+    try:
+        Path(path or AI_KEY_PATH).unlink()
+    except FileNotFoundError:
+        pass
+
+
 SETTINGS = load_settings()
+AI_SETTINGS = load_ai_settings()
+
+
+def current_limits() -> dict:
+    """Limites efetivos de transferência/editor (com teto rígido)."""
+    return malta_files.parse_limits(SETTINGS)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +397,7 @@ class MaltaSerial:
         self.ser = None
         self.lock = threading.Lock()
         self.counter = 0
+        self.last_exit: int | None = None
 
     # -- conexão ---------------------------------------------------------
     def _open(self, port: str):
@@ -181,6 +433,10 @@ class MaltaSerial:
     def _clean(self, raw: str, sent: str, marker: str) -> str:
         text = raw.replace("\r", "")
         full = sent + f"; echo {marker}"
+        # O protocolo novo ecoa também o código de saída. Se o eco trouxe
+        # esse trecho, ele faz parte do que precisa ser removido.
+        if f"echo {EXIT_TOKEN}" in text[:4000]:
+            full = sent + f"; echo {EXIT_TOKEN}$?__; echo {marker}"
 
         # O terminal ecoa o comando inteiro (com quebras de linha a cada ~80
         # colunas). Removemos exatamente len(full) caracteres não-newline a
@@ -202,7 +458,7 @@ class MaltaSerial:
 
         out = []
         for line in text.split("\n"):
-            if marker in line:
+            if marker in line or EXIT_TOKEN in line:
                 continue
             # Remove sequências ANSI e o pedido de posição do cursor.
             line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
@@ -219,8 +475,10 @@ class MaltaSerial:
     def _attempt(self, payload: str, timeout: float):
         marker = MARKER % self.counter
         self.counter += 1
+        self.last_exit = None
         try:
-            self.ser.write((payload + f"; echo {marker}\n").encode("utf-8", "replace"))
+            wire = payload + f"; echo {EXIT_TOKEN}$?__; echo {marker}\n"
+            self.ser.write(wire.encode("utf-8", "replace"))
             self.ser.flush()
         except Exception as exc:
             self.close()
@@ -243,30 +501,54 @@ class MaltaSerial:
             # Só consideramos concluído quando o marker aparece sozinho numa
             # linha (o eco tem o marker precedido por espaço, não por \n).
             if re.search(r"(?:^|\r?\n)" + re.escape(marker) + r"\r?\n", buf):
+                exit_match = re.search(re.escape(EXIT_TOKEN) + r"(-?\d+)__", buf)
+                if exit_match:
+                    self.last_exit = int(exit_match.group(1))
                 return True, self._clean(buf, payload, marker), False
 
+        exit_match = re.search(re.escape(EXIT_TOKEN) + r"(-?\d+)__", buf)
+        if exit_match:
+            self.last_exit = int(exit_match.group(1))
         cleaned = self._clean(buf, payload, marker)
         if got_any:
             return False, cleaned or "timeout", False
         return False, "sem resposta", True
 
+    def _run_locked(self, cmd: str, timeout: float = 8, retries: int = 1):
+        for attempt in range(retries + 1):
+            if self.ser is None and not self.connect():
+                return False, "serial indisponível — celular conectado?", True
+            ok, out, fatal = self._attempt(cmd, timeout)
+            if ok:
+                return True, out, False
+            if fatal:
+                self.close()
+                if attempt < retries:
+                    time.sleep(0.3)
+                    continue
+                return False, out, True
+            return False, out, False
+        return False, "falha serial", True
+
+    @contextmanager
+    def sequence(self):
+        """Segura o lock por uma sequência de comandos (ex.: stty + chave)."""
+        with self.lock:
+            yield self._run_locked
+
+    def try_run(self, cmd: str, timeout: float = 5, retries: int = 0):
+        """Tenta executar sem esperar; devolve ocupado se outro comando roda."""
+        if not self.lock.acquire(blocking=False):
+            return False, "serial ocupado", False
+        try:
+            return self._run_locked(cmd, timeout, retries)
+        finally:
+            self.lock.release()
+
     def run(self, cmd: str, timeout: float = 8, retries: int = 1):
         """Executa e retorna (ok, saída, fatal). Sempre uma 3-tupla."""
         with self.lock:
-            for attempt in range(retries + 1):
-                if self.ser is None and not self.connect():
-                    return False, "serial indisponível — celular conectado?", True
-                ok, out, fatal = self._attempt(cmd, timeout)
-                if ok:
-                    return True, out, False
-                if fatal:
-                    self.close()
-                    if attempt < retries:
-                        time.sleep(0.3)
-                        continue
-                    return False, out, True
-                return False, out, False
-            return False, "falha serial", True
+            return self._run_locked(cmd, timeout, retries)
 
 
 malta = MaltaSerial()
@@ -440,6 +722,7 @@ def cached_status() -> dict:
     status["prov"] = prov
     status["probe"] = probe
     status["settings"] = dict(SETTINGS)
+    status["limits"] = current_limits()
     status["version"] = VERSION
     status["app_uptime"] = int(time.time() - APP_START)
     status["port"] = malta.port
@@ -818,7 +1101,12 @@ def api_actions():
     return jsonify({
         "ok": True,
         "actions": [
-            {"key": key, "label": value["label"], "danger": bool(value.get("danger"))}
+            {
+                "key": key,
+                "label": value["label"],
+                "danger": bool(value.get("danger")),
+                "requires_confirm": bool(value.get("danger")),
+            }
             for key, value in ACTIONS.items()
         ],
     })
@@ -834,6 +1122,13 @@ def api_action():
     if key not in ACTIONS:
         return jsonify({"ok": False, "error": f"ação desconhecida: {key}"}), 400
     spec = ACTIONS[key]
+    if spec.get("danger") and not bool(data.get("confirm")):
+        return jsonify({
+            "ok": False,
+            "error": "esta ação é destrutiva; confirme explicitamente",
+            "code": "confirm_required",
+            "action": key,
+        }), 409
     if key == "reboot":
         malta.run(spec["cmd"], timeout=spec["timeout"])
         log_event("reboot do celular solicitado", "warn")
@@ -853,8 +1148,25 @@ def api_cmd():
         return jsonify({"ok": False, "output": "comando muito longo (max 500)"}), 400
     if cmd.rstrip().endswith("&") and not cmd.rstrip().endswith("&&"):
         cmd = f"({cmd})"
+    started = time.time()
     ok, out, _ = malta.run(cmd, timeout=15)
-    return jsonify({"ok": ok, "output": out})
+    elapsed_ms = round((time.time() - started) * 1000)
+    exit_code = getattr(malta, "last_exit", None)
+    success = bool(ok and (exit_code in (None, 0)))
+    if not ok:
+        state = "error"
+    elif success:
+        state = "ok"
+    else:
+        state = "failed"
+    return jsonify({
+        "ok": ok,
+        "output": out,
+        "exit_code": exit_code,
+        "success": success,
+        "state": state,
+        "elapsed_ms": elapsed_ms,
+    })
 
 
 @app.get("/api/network")
@@ -881,6 +1193,483 @@ def api_network_refresh():
     return jsonify({"ok": not result.get("error"), "probe": result})
 
 
+# ---------------------------------------------------------------------------
+# Caches de diagnóstico (o inventário é caro: um round-trip serial grande)
+# ---------------------------------------------------------------------------
+SYSTEM_LOCK = threading.Lock()
+SYSTEM_CACHE: dict = {"ts": 0.0, "data": None}
+SYSTEM_TTL = 30.0
+NET_DETAIL_LOCK = threading.Lock()
+NET_DETAIL_CACHE: dict = {"ts": 0.0, "data": None}
+NET_DETAIL_TTL = 20.0
+
+
+def _payload() -> dict:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _api_error(exc) -> tuple:
+    """Converte FileError/DiagnosticsError/CatalogError/AiError em JSON."""
+    return jsonify({
+        "ok": False,
+        "error": str(exc),
+        "code": getattr(exc, "code", "error"),
+    }), int(getattr(exc, "status", 400))
+
+
+def system_snapshot(force: bool = False) -> dict:
+    now = time.time()
+    with SYSTEM_LOCK:
+        cached = SYSTEM_CACHE
+        if not force and cached["data"] is not None and now - cached["ts"] < SYSTEM_TTL:
+            return {"data": cached["data"], "cached": True,
+                    "age": round(now - cached["ts"], 1), "ttl_s": SYSTEM_TTL}
+    data = malta_diagnostics.collect_system(malta.run)
+    with SYSTEM_LOCK:
+        SYSTEM_CACHE.update({"ts": time.time(), "data": data})
+    return {"data": data, "cached": False, "age": 0.0, "ttl_s": SYSTEM_TTL}
+
+
+def network_snapshot(force: bool = False) -> dict:
+    now = time.time()
+    with NET_DETAIL_LOCK:
+        cached = NET_DETAIL_CACHE
+        if not force and cached["data"] is not None and now - cached["ts"] < NET_DETAIL_TTL:
+            return {"data": cached["data"], "cached": True,
+                    "age": round(now - cached["ts"], 1), "ttl_s": NET_DETAIL_TTL}
+    data = malta_diagnostics.collect_network(malta.run)
+    with NET_DETAIL_LOCK:
+        NET_DETAIL_CACHE.update({"ts": time.time(), "data": data})
+    return {"data": data, "cached": False, "age": 0.0, "ttl_s": NET_DETAIL_TTL}
+
+
+# ---------------------------------------------------------------------------
+# Explorador e editor de arquivos
+# ---------------------------------------------------------------------------
+@app.get("/api/files/roots")
+def api_files_roots():
+    try:
+        roots = malta_files.list_roots(malta.run)
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, "roots": roots, "limits": current_limits()})
+
+
+@app.get("/api/files")
+def api_files_list():
+    try:
+        path = malta_files.normalize_path(request.args.get("path") or "/")
+        data = malta_files.list_dir(malta.run, path)
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **data, "limits": current_limits()})
+
+
+@app.get("/api/files/stat")
+def api_files_stat():
+    try:
+        path = malta_files.normalize_path(request.args.get("path"))
+        data = malta_files.stat_path(malta.run, path)
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **data})
+
+
+@app.get("/api/files/read")
+def api_files_read():
+    try:
+        path = malta_files.normalize_path(request.args.get("path"))
+        data = malta_files.read_text(malta.run, path, current_limits()["editor"])
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **data, "limits": current_limits()})
+
+
+@app.post("/api/files/write")
+def api_files_write():
+    data = _payload()
+    try:
+        path = malta_files.normalize_path(data.get("path"))
+        result = malta_files.write_text(
+            malta.run,
+            path,
+            data.get("content", ""),
+            current_limits()["editor"],
+            confirm=bool(data.get("confirm")),
+        )
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    log_event(f"arquivo gravado: {result['resolved']} ({result['bytes']} bytes)", "info")
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/files/upload")
+def api_files_upload():
+    data = _payload()
+    try:
+        path = malta_files.normalize_path(data.get("path"))
+        raw = base64.b64decode(str(data.get("content", "")), validate=True)
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    except Exception:
+        return jsonify({"ok": False, "error": "base64 inválido", "code": "bad_base64"}), 400
+    limit = current_limits()["upload"]
+    if len(raw) > limit:
+        return jsonify({
+            "ok": False,
+            "error": f"arquivo grande ({len(raw)} bytes; limite {limit})",
+            "code": "too_large",
+        }), 413
+    mode = str(data.get("mode") or "0644")
+    if not re.fullmatch(r"[0-7]{3,4}", mode):
+        mode = "0644"
+    try:
+        result = malta_files.write_bytes(
+            malta.run, path, raw, limit, mode=mode, confirm=bool(data.get("confirm")),
+        )
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    log_event(f"upload {result['resolved']} ({len(raw)} bytes)", "info")
+    return jsonify({"ok": True, **result})
+
+
+@app.get("/api/files/download")
+def api_files_download():
+    try:
+        path = malta_files.normalize_path(request.args.get("path"))
+        raw, meta = malta_files.read_bytes(malta.run, path, current_limits()["download"])
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    name = Path(meta["resolved"]).name or "arquivo"
+    ascii_name = name.encode("ascii", "ignore").decode("ascii").replace('"', "") or "arquivo"
+    log_event(f"download {meta['resolved']} ({len(raw)} bytes)", "info")
+    return Response(
+        raw,
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name)}',
+        },
+    )
+
+
+@app.post("/api/files/mkdir")
+def api_files_mkdir():
+    data = _payload()
+    try:
+        path = malta_files.normalize_path(data.get("path"))
+        result = malta_files.make_dir(malta.run, path, confirm=bool(data.get("confirm")))
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    log_event(f"diretório criado: {result['resolved']}", "info")
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/files/rename")
+def api_files_rename():
+    data = _payload()
+    try:
+        source = malta_files.normalize_path(data.get("path"))
+        destination = malta_files.normalize_path(data.get("destination") or data.get("to"))
+        result = malta_files.rename(
+            malta.run, source, destination, confirm=bool(data.get("confirm")),
+        )
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    log_event(f"renomeado: {result['resolved']} → {result['resolved_destination']}", "info")
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/files/delete")
+def api_files_delete():
+    data = _payload()
+    try:
+        path = malta_files.normalize_path(data.get("path"))
+        result = malta_files.delete(
+            malta.run, path,
+            recursive=bool(data.get("recursive")),
+            confirm=bool(data.get("confirm")),
+        )
+    except malta_files.FileError as exc:
+        return _api_error(exc)
+    log_event(f"excluído: {result['resolved']}", "warn")
+    return jsonify({"ok": True, **result})
+
+
+# ---------------------------------------------------------------------------
+# Inventário, diagnóstico de rede, catálogo e IA
+# ---------------------------------------------------------------------------
+@app.get("/api/system")
+def api_system():
+    force = request.args.get("refresh") in ("1", "true", "yes")
+    try:
+        snapshot = system_snapshot(force=force)
+    except malta_diagnostics.DiagnosticsError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **snapshot})
+
+
+@app.get("/api/network/detail")
+def api_network_detail():
+    force = request.args.get("refresh") in ("1", "true", "yes")
+    try:
+        snapshot = network_snapshot(force=force)
+    except malta_diagnostics.DiagnosticsError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **snapshot})
+
+
+@app.get("/api/catalog")
+def api_catalog():
+    try:
+        data = malta_catalog.compose(CATALOG_PATH)
+    except malta_catalog.CatalogError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **data})
+
+
+@app.post("/api/catalog/check")
+def api_catalog_check():
+    data = _payload()
+    ids = data.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        return jsonify({"ok": False, "error": "ids precisa ser uma lista",
+                        "code": "ids_invalid"}), 400
+    if isinstance(ids, list):
+        ids = [str(item) for item in ids][:120]
+    try:
+        result = malta_catalog.check_items(
+            CATALOG_PATH, ids=ids or None, runner=malta.run,
+        )
+    except malta_catalog.CatalogError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, **result})
+
+
+@app.get("/api/catalog/local")
+def api_catalog_local():
+    try:
+        items = malta_catalog.load_local(CATALOG_PATH)
+    except malta_catalog.CatalogError as exc:
+        return _api_error(exc)
+    return jsonify({"ok": True, "items": items})
+
+
+@app.post("/api/catalog/local")
+def api_catalog_local_add():
+    data = _payload()
+    try:
+        item = malta_catalog.add_local(data, CATALOG_PATH)
+    except malta_catalog.CatalogError as exc:
+        return _api_error(exc)
+    log_event(f"catálogo local: item {item['id']} adicionado", "info")
+    return jsonify({"ok": True, "item": item})
+
+
+@app.delete("/api/catalog/local")
+def api_catalog_local_remove():
+    data = _payload()
+    try:
+        malta_catalog.remove_local(str(data.get("id") or ""), CATALOG_PATH)
+    except malta_catalog.CatalogError as exc:
+        return _api_error(exc)
+    log_event(f"catálogo local: item {data.get('id')} removido", "info")
+    return jsonify({"ok": True})
+
+
+def _ai_context(extra: dict | None = None) -> dict:
+    status = cached_status()
+    data_df = status.get("data_df") or {}
+    context = {
+        "page": (extra or {}).get("page"),
+        "path": (extra or {}).get("path"),
+        "online": bool(status.get("online")),
+        "kernel": status.get("kernel"),
+        "data_mounted": bool(status.get("data_mounted")),
+        "rndis_ip": status.get("rndis_ip"),
+        "battery_pct": status.get("capacity_pct"),
+        "uptime_s": status.get("uptime_s"),
+        "load1": status.get("load1"),
+        "mem_pct": status.get("mem_pct"),
+        "data_pct": data_df.get("pct"),
+        "last_error": status.get("error") or "",
+        "version": VERSION,
+    }
+    return malta_ai.sanitize_context({k: v for k, v in context.items() if v is not None})
+
+
+def ai_status_payload(
+    check_key: bool = False,
+    known_key_present: bool | None = None,
+) -> dict:
+    """Status efetivo; a chave nunca entra no retorno."""
+    with AI_LOCK:
+        overrides = dict(AI_SETTINGS)
+    mode = malta_ai.effective_mode(overrides)
+    key_present = None
+    pc_key = ""
+    key_error = ""
+    if mode == "device":
+        key_present = known_key_present
+        if key_present is None and check_key:
+            key_present = malta_ai.device_key_present(malta)
+    else:
+        pc_key, key_error = read_ai_key()
+    return malta_ai.status(
+        overrides,
+        key_present=key_present,
+        pc_key_set=bool(pc_key),
+        key_error=key_error,
+    )
+
+
+@app.get("/api/ai/status")
+def api_ai_status():
+    check = request.args.get("check_key", "").lower() in ("1", "true", "yes", "on")
+    return jsonify({"ok": True, **ai_status_payload(check_key=check)})
+
+
+@app.post("/api/ai/config")
+def api_ai_config():
+    global AI_SETTINGS
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "JSON inválido",
+            "code": "ai_config",
+        }), 400
+    try:
+        clean = malta_ai.validate_config(data)
+    except malta_ai.AiError as exc:
+        return _api_error(exc)
+    with AI_LOCK:
+        try:
+            AI_SETTINGS = save_ai_settings(clean)
+        except OSError as exc:
+            return jsonify({
+                "ok": False,
+                "error": f"não foi possível salvar a configuração: {exc}",
+                "code": "ai_config_write",
+            }), 500
+    log_event("configuração da IA atualizada", "info")
+    return jsonify({"ok": True, "status": ai_status_payload(check_key=True)})
+
+
+@app.post("/api/ai/key")
+def api_ai_key():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("key"), str):
+        return jsonify({
+            "ok": False,
+            "error": "chave inválida",
+            "code": "ai_key_invalid",
+        }), 400
+    key = data["key"]
+    with AI_LOCK:
+        overrides = dict(AI_SETTINGS)
+    mode = malta_ai.effective_mode(overrides)
+    try:
+        if mode == "device":
+            lock = getattr(malta, "lock", None)
+            if lock is not None and lock.locked():
+                return jsonify({
+                    "ok": False,
+                    "error": "serial ocupado; aguarde a operação atual",
+                    "code": "serial_busy",
+                }), 409
+            malta_ai.write_device_key(malta, key)
+            target = "device"
+            known = True
+        else:
+            write_ai_key(key)
+            target = "pc"
+            known = None
+    except malta_ai.AiError as exc:
+        return _api_error(exc)
+    except OSError as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"não foi possível salvar a chave: {exc}",
+            "code": "ai_key_write",
+        }), 500
+    log_event(f"chave da IA atualizada ({target})", "info")
+    return jsonify({
+        "ok": True,
+        "target": target,
+        "status": ai_status_payload(known_key_present=known),
+    })
+
+
+@app.delete("/api/ai/key")
+def api_ai_key_delete():
+    with AI_LOCK:
+        overrides = dict(AI_SETTINGS)
+    mode = malta_ai.effective_mode(overrides)
+    try:
+        if mode == "device":
+            lock = getattr(malta, "lock", None)
+            if lock is not None and lock.locked():
+                return jsonify({
+                    "ok": False,
+                    "error": "serial ocupado; aguarde a operação atual",
+                    "code": "serial_busy",
+                }), 409
+            malta_ai.remove_device_key(malta)
+            target = "device"
+            known = False
+        else:
+            remove_ai_key()
+            target = "pc"
+            known = None
+    except malta_ai.AiError as exc:
+        return _api_error(exc)
+    except OSError as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"não foi possível remover a chave: {exc}",
+            "code": "ai_key_remove",
+        }), 500
+    log_event(f"chave da IA removida ({target})", "info")
+    return jsonify({
+        "ok": True,
+        "target": target,
+        "status": ai_status_payload(known_key_present=known),
+    })
+
+
+@app.post("/api/ai/chat")
+def api_ai_chat():
+    data = _payload()
+    with AI_LOCK:
+        overrides = dict(AI_SETTINGS)
+    if malta_ai.effective_mode(overrides) == "http":
+        pc_key, key_error = read_ai_key()
+        if key_error:
+            return jsonify({
+                "ok": False,
+                "error": key_error,
+                "code": "ai_key_invalid",
+            }), 503
+        if pc_key:
+            overrides["api_key"] = pc_key
+    try:
+        config = malta_ai.load_config(overrides)
+        messages = malta_ai.normalize_messages(data.get("messages"))
+    except malta_ai.AiError as exc:
+        return _api_error(exc)
+    raw_context = data.get("context") if isinstance(data.get("context"), dict) else {}
+    context = _ai_context(raw_context)
+    try:
+        result = malta_ai.chat(config, messages, context, runner=malta)
+    except malta_ai.AiError as exc:
+        log_event(f"IA: falha no provedor ({exc.code})", "warn")
+        return _api_error(exc)
+    log_event("IA: resposta recebida (somente sugestão)", "info")
+    return jsonify({"ok": True, **result})
+
+
 def _validate_path(path: str | None) -> str | None:
     if not isinstance(path, str):
         return None
@@ -900,11 +1689,17 @@ def api_upload():
     if not path:
         return jsonify({"ok": False, "error": "caminho inválido"}), 400
     try:
+        path = malta_files.normalize_path(path)
+        malta_files.ensure_writable(path, confirm=bool(data.get("confirm")))
+    except malta_files.FileError as exc:
+        return jsonify({"ok": False, "error": str(exc), "code": exc.code}), exc.status
+    try:
         raw = base64.b64decode(str(data.get("content", "")), validate=True)
     except Exception:
         return jsonify({"ok": False, "error": "base64 inválido"}), 400
-    if len(raw) > UPLOAD_LIMIT:
-        return jsonify({"ok": False, "error": f"arquivo grande (limite {UPLOAD_LIMIT} bytes)"}), 413
+    limit = current_limits()["upload"]
+    if len(raw) > limit:
+        return jsonify({"ok": False, "error": f"arquivo grande (limite {limit} bytes)"}), 413
     mode = str(data.get("mode") or "0644")
     if not re.fullmatch(r"[0-7]{3,4}", mode):
         mode = "0644"
@@ -934,6 +1729,11 @@ def api_download():
     path = _validate_path(request.args.get("path", ""))
     if not path:
         return jsonify({"ok": False, "error": "caminho inválido"}), 400
+    try:
+        path = malta_files.normalize_path(path)
+        malta_files.ensure_readable(path)
+    except malta_files.FileError as exc:
+        return jsonify({"ok": False, "error": str(exc), "code": exc.code}), exc.status
     ok, out, _ = malta.run(f"wc -c < '{path}'", timeout=8)
     if not ok:
         return jsonify({"ok": False, "error": out or "arquivo não encontrado"}), 404
@@ -941,10 +1741,11 @@ def api_download():
         size = int(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
         return jsonify({"ok": False, "error": "arquivo inválido"}), 404
-    if size > DOWNLOAD_LIMIT:
+    limit = current_limits()["download"]
+    if size > limit:
         return jsonify({
             "ok": False,
-            "error": f"arquivo grande ({size} bytes; limite {DOWNLOAD_LIMIT})",
+            "error": f"arquivo grande ({size} bytes; limite {limit})",
         }), 413
     ok, out, _ = malta.run(f"base64 '{path}'", timeout=30)
     if not ok:

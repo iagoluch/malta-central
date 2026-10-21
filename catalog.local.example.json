@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Painel local",
+    "description": "Exemplo de link para um serviço que roda no próprio PC.",
+    "category": "Locais",
+    "type": "link",
+    "url": "http://127.0.0.1:9000/"
+  },
+  {
+    "name": "SSH do celular",
+    "description": "Exemplo de serviço TCP na porta do Dropbear.",
+    "category": "Locais",
+    "type": "service",
+    "host": "10.55.0.2",
+    "port": 22
+  }
+]

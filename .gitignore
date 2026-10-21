@@ -1,3 +1,19 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# Estado local do app (nunca versionar)
+settings.json
+settings.json.tmp
+catalog.local.json
+catalog.local.json.tmp
+ai.json
+ai.json.tmp
+ai.key
+ai.key.tmp
+.env
+
+# Ferramentas
+.pytest_cache/
+node_modules/
