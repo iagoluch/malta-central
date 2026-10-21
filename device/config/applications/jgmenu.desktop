@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Menu de aplicativos
+Name[pt_BR]=Menu de aplicativos
+Comment=Menu de aplicativos do Malta Desktop
+Exec=jgmenu_run
+Icon=malta-menu
+Terminal=false
+Categories=System;DesktopSettings;

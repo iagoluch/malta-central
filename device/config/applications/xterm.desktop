@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Name[pt_BR]=Terminal
+Comment=Terminal do Malta Desktop
+Exec=xterm
+Icon=malta-terminal
+Terminal=false
+Categories=System;TerminalEmulator;

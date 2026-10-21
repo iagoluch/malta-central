@@ -1,0 +1,45 @@
+# Malta Desktop: configuracao do jgmenu 4.5.0 (Alpine armv7).
+# Configuracao minima e valida: menu claro, largura 220, fonte DejaVu Sans 9
+# e tint2_look desligado (o painel e do tint2, nao do jgmenu).
+#
+# A lista de aplicativos vem do CSV do bundle (jgmenu-apps.csv): o jgmenu nao
+# gera o arquivo sozinho neste ambiente e, sem ele, o menu so mostrava os
+# itens internos desabilitados ("Settings"/"System").
+csv_cmd = cat /etc/xdg/jgmenu/jgmenu-apps.csv
+font = DejaVu Sans 9
+menu_width = 220
+menu_height = 0
+menu_xoffset = 0
+menu_yoffset = 0
+halign = center
+valign = center
+columns = 1
+column_width = 200
+separator = yes
+hide_on_start = no
+show_placeholders = no
+icon_size = 24
+icon_theme = hicolor
+window_type = normal
+center_context_menu = no
+desktop_context_menu = no
+selection_mode = append
+tooltip_show_timeout = 0.5
+tint2_look = 0
+single_window = no
+horizontal = no
+rasterize = no
+no_transparency = no
+dynamic_history = no
+run_command = ""
+run_notify = ""
+run_terminal = ""
+# Cores: os nomes das opcoes sao os do jgmenu 4.5 (color_norm_fg e nao
+# color_menu_fg; um nome desconhecido e silenciosamente ignorado e o item
+# sai com a cor padrao, quase invisivel sobre o fundo branco).
+color_menu_bg = #ffffff 255
+color_norm_fg = #2c001e 255
+color_menu_border = #2c001e 255
+color_sel_bg = #2c001e 255
+color_sel_fg = #ffffff 255
+color_sep_fg = #2c001e 255

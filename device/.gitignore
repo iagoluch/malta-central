@@ -1,0 +1,9 @@
+# O bundle do aparelho e versionado (scripts e config). Estes caminhos so
+# existem quando os scripts sao rodados localmente e nao devem ser versionados.
+# No celular o mesmo conteudo vive em /data/malta-desktop.
+logs/
+run/
+apk-cache/
+root/
+version
+vncpasswd

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Arquivos
+Name[pt_BR]=Arquivos
+Comment=Gerenciador de arquivos do Malta Desktop
+Exec=pcmanfm %U
+Icon=malta-files
+Terminal=false
+Categories=System;FileTools;FileManager;
