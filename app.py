@@ -120,12 +120,12 @@ def serial_port_candidates(platform_name: str | None = None, ports=None,
         return list(dict.fromkeys(values))
 
     def sort_key(device: str):
-        match = re.fullmatch(r"COM(\\d+)", device, re.IGNORECASE)
+        match = re.fullmatch(r"COM(\d+)", device, re.IGNORECASE)
         return (0, int(match.group(1))) if match else (1, device.casefold())
 
     if platform_name in ("nt", "win32", "windows"):
         com_ports = [device for device in discovered
-                     if re.fullmatch(r"COM\\d+", device, re.IGNORECASE)]
+                     if re.fullmatch(r"COM\d+", device, re.IGNORECASE)]
         usb_serial = [
             device for device in com_ports
             if any(token in discovered[device]

@@ -84,7 +84,7 @@ imagem Alpine alterada.
 
 1. Instale Python 3.10 ou superior pelo [python.org](https://www.python.org/downloads/windows/)
    e mantenha o Python Launcher (`py`) habilitado no instalador.
-2. Baixe/clon​e este repositório e extraia-o em uma pasta gravável.
+2. Baixe/clone este repositório e extraia-o em uma pasta gravável.
 3. Conecte o Moto E7 Power por USB.
 4. Dê duplo clique em `run_windows.bat`. Na primeira execução, o script cria `.venv`,
    instala as dependências e abre o navegador em `http://127.0.0.1:8666`.
