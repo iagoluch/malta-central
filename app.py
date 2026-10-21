@@ -45,21 +45,100 @@ try:
 except ImportError:  # pragma: no cover - dependência de runtime
     sys.exit("pyserial ausente: rode `pip install -r requirements.txt`")
 
+try:
+    from serial.tools import list_ports
+except ImportError:  # pragma: no cover - fallback defensivo
+    list_ports = None
+
 import malta_ai
 import malta_catalog
 import malta_diagnostics
 import malta_files
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 BAUD = 115200
 MARKER = "__MC%d_DONE__"
 EXIT_TOKEN = "__MCXI"
 PORT_CANDIDATES = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2"]
 BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = BASE_DIR / "settings.json"
-AI_SETTINGS_PATH = BASE_DIR / "ai.json"
-AI_KEY_PATH = BASE_DIR / "ai.key"
-CATALOG_PATH = BASE_DIR / "catalog.local.json"
+
+
+def _state_directory() -> Path:
+    """Diretório de estado local; no Windows, evita gravar chaves no clone do Git."""
+    if os.name != "nt":
+        return BASE_DIR
+    appdata = os.environ.get("LOCALAPPDATA")
+    root = Path(appdata) if appdata else Path.home() / "AppData" / "Local"
+    target = root / "malta-central"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    except OSError:
+        # Último recurso para instalações portáteis sem LOCALAPPDATA gravável.
+        return BASE_DIR
+
+
+STATE_DIR = _state_directory()
+SETTINGS_PATH = STATE_DIR / "settings.json"
+AI_SETTINGS_PATH = STATE_DIR / "ai.json"
+AI_KEY_PATH = STATE_DIR / "ai.key"
+CATALOG_PATH = STATE_DIR / "catalog.local.json"
+
+
+def serial_port_candidates(platform_name: str | None = None, ports=None,
+                           explicit: str | None = None) -> list[str]:
+    """Descobre a serial do telefone em Linux/macOS e Windows sem adivinhar portas COM.
+
+    MC_SERIAL_PORT tem precedência e, quando informado, limita a conexão à porta
+    escolhida pelo usuário. No Windows, portas COM só são tentadas automaticamente
+    quando têm descrição USB/serial reconhecível ou quando existe apenas uma.
+    """
+    platform_name = platform_name or os.name
+    if explicit is None:
+        explicit = os.environ.get("MC_SERIAL_PORT", "")
+    explicit = str(explicit or "").strip()
+    if explicit:
+        return [explicit]
+
+    if ports is None:
+        try:
+            ports = list(list_ports.comports()) if list_ports is not None else []
+        except Exception:
+            ports = []
+
+    discovered: dict[str, str] = {}
+    for item in ports:
+        device = str(getattr(item, "device", "") or "").strip()
+        if not device:
+            continue
+        description = str(getattr(item, "description", "") or "")
+        hwid = str(getattr(item, "hwid", "") or "")
+        manufacturer = str(getattr(item, "manufacturer", "") or "")
+        discovered[device] = " ".join((description, hwid, manufacturer)).lower()
+
+    def unique(values):
+        return list(dict.fromkeys(values))
+
+    def sort_key(device: str):
+        match = re.fullmatch(r"COM(\\d+)", device, re.IGNORECASE)
+        return (0, int(match.group(1))) if match else (1, device.casefold())
+
+    if platform_name in ("nt", "win32", "windows"):
+        com_ports = [device for device in discovered
+                     if re.fullmatch(r"COM\\d+", device, re.IGNORECASE)]
+        usb_serial = [
+            device for device in com_ports
+            if any(token in discovered[device]
+                   for token in ("usb", "cdc", "acm", "serial", "motorola", "malta"))
+        ]
+        selected = usb_serial if usb_serial else (com_ports if len(com_ports) == 1 else [])
+        return sorted(unique(selected), key=sort_key)
+
+    preferred = [
+        device for device in discovered
+        if device.startswith(("/dev/ttyACM", "/dev/ttyUSB", "/dev/serial/by-id/"))
+    ]
+    return unique(preferred + PORT_CANDIDATES)
 # Limites efetivos vêm de malta_files.parse_limits(SETTINGS), com teto rígido.
 MAX_BODY = 2 * 1024 * 1024
 
@@ -288,7 +367,7 @@ def _write_private(path: Path, text: str) -> None:
 def load_ai_settings(path: Path | str | None = None) -> dict:
     """Lê ai.json sem seguir symlink; ausente ou inválido cai no ambiente."""
     target = Path(path or AI_SETTINGS_PATH)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | (getattr(os, "O_NONBLOCK", 0) if os.name != "nt" else 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -330,7 +409,7 @@ def save_ai_settings(data: dict, path: Path | str | None = None) -> dict:
 def read_ai_key(path: Path | str | None = None) -> tuple[str, str]:
     """Lê a chave HTTP local sem seguir symlink e corrige modo frouxo."""
     target = Path(path or AI_KEY_PATH)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | (getattr(os, "O_NONBLOCK", 0) if os.name != "nt" else 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -347,7 +426,8 @@ def read_ai_key(path: Path | str | None = None) -> tuple[str, str]:
         if info.st_mode & 0o077:
             try:
                 os.fchmod(fd, 0o600)
-            except OSError:
+            except (OSError, AttributeError, NotImplementedError):
+                # No Windows, a proteção de acesso é provida pela ACL do perfil do usuário.
                 pass
     except OSError:
         return "", "não foi possível ler a chave do PC"
@@ -410,7 +490,7 @@ class MaltaSerial:
         return ser
 
     def connect(self) -> bool:
-        for port in PORT_CANDIDATES:
+        for port in serial_port_candidates():
             try:
                 self.ser = self._open(port)
                 self.port = port
@@ -1765,4 +1845,8 @@ def api_download():
 
 if __name__ == "__main__":
     port = int(os.environ.get("MC_PORT", "8666"))
+    if os.environ.get("MC_OPEN_BROWSER", "").strip().lower() in {"1", "true", "yes", "on"}:
+        import webbrowser
+        url = f"http://127.0.0.1:{port}/"
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host="127.0.0.1", port=port, threaded=True, use_reloader=False)

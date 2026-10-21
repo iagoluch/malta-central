@@ -1,4 +1,4 @@
-# malta-central v3
+# malta-central v3.1
 
 **Desktop web local para administrar o Alpine Linux nativo do Motorola Moto E7 Power
 (XT2097-5, "malta")** — shell root, arquivos, diagnóstico, catálogo e um assistente de IA
@@ -76,6 +76,51 @@ PC (malta-central)                         Celular (malta)
 
 Após um reboot do celular, o ciclo 2–6 roda sozinho. O app espera o ACM voltar, recria o RNDIS,
 reconecta e só então marca `prov=ok`.
+
+## Windows 10/11 — iniciar a central no PC
+
+O desktop web também roda no Windows. O telefone não precisa ser reflasheado nem ter sua
+imagem Alpine alterada.
+
+1. Instale Python 3.10 ou superior pelo [python.org](https://www.python.org/downloads/windows/)
+   e mantenha o Python Launcher (`py`) habilitado no instalador.
+2. Baixe/clon​e este repositório e extraia-o em uma pasta gravável.
+3. Conecte o Moto E7 Power por USB.
+4. Dê duplo clique em `run_windows.bat`. Na primeira execução, o script cria `.venv`,
+   instala as dependências e abre o navegador em `http://127.0.0.1:8666`.
+5. Para encerrar, volte à janela do terminal e pressione Ctrl+C.
+
+O painel inicia mesmo que o telefone esteja desconectado; nesse caso, as telas continuam
+acessíveis, mas os recursos que dependem do aparelho aparecem como offline.
+
+### Porta serial no Windows
+
+O Windows precisa enumerar o console USB do telefone como uma porta COM. Confira em
+**Gerenciador de Dispositivos → Portas (COM e LPT)**. A central tenta descobrir portas USB/
+serial reconhecíveis automaticamente. Se houver várias portas COM e a correta não for
+identificada, edite `run_windows.bat` e defina a porta do console, por exemplo:
+
+```bat
+set "MC_SERIAL_PORT=COM5"
+```
+
+Substitua `COM5` pela porta que aparece no Gerenciador de Dispositivos. Se nenhuma porta
+serial for criada pelo Windows, o painel ainda abre, mas será necessário resolver o driver/
+enumeração USB antes de controlar o aparelho. Não escolha uma porta COM aleatória.
+
+As configurações locais e a chave da IA ficam em
+`%LOCALAPPDATA%\\malta-central`, fora do clone do Git. As permissões de segredo usam as
+ACLs do perfil de usuário do Windows; os modos POSIX `0600` não se aplicam ao NTFS.
+
+### Limite da compatibilidade Windows
+
+O launcher configura o aplicativo web e a conexão serial. Ele **não configura automaticamente
+o compartilhamento de internet/NAT do Windows para a interface RNDIS**. Essa parte do
+procedimento documentado — NetworkManager, dispatcher, `iptables` e serviço `systemd` —
+é específica do host Linux. No Windows, as funções locais da central e o console serial podem
+ser usados sem isso; testes de rede e acesso a serviços em `10.55.0.2` dependem de o adaptador
+RNDIS do Windows ter a configuração IP/rota apropriada. O servidor web continua restrito a
+`127.0.0.1` e não deve ser exposto diretamente à rede.
 
 ## Instalação e operação
 

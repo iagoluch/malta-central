@@ -747,7 +747,10 @@ class ApiV3Tests(unittest.TestCase):
         saved = json.loads(mc.AI_SETTINGS_PATH.read_text(encoding="utf-8"))
         self.assertEqual(saved["model"], "nvidia/modelo")
         self.assertNotIn("key", saved)
-        self.assertEqual(mc.AI_SETTINGS_PATH.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(mc.AI_SETTINGS_PATH.stat().st_mode & 0o777, 0o600)
+        else:
+            self.assertTrue(mc.AI_SETTINGS_PATH.is_file())
 
         response = self.client.post("/api/ai/key", json={"key": key})
         self.assertEqual(response.status_code, 200, response.data)
@@ -755,7 +758,10 @@ class ApiV3Tests(unittest.TestCase):
         self.assertEqual(data["target"], "pc")
         self.assertNotIn(key, response.data.decode())
         self.assertEqual(mc.AI_KEY_PATH.read_text(encoding="utf-8"), key + "\n")
-        self.assertEqual(mc.AI_KEY_PATH.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(mc.AI_KEY_PATH.stat().st_mode & 0o777, 0o600)
+        else:
+            self.assertTrue(mc.AI_KEY_PATH.is_file())
         self.assertNotIn(key, mc.AI_SETTINGS_PATH.read_text(encoding="utf-8"))
 
         response = self.client.get("/api/ai/status")
