@@ -109,7 +109,7 @@ serial for criada pelo Windows, o painel ainda abre, mas será necessário resol
 enumeração USB antes de controlar o aparelho. Não escolha uma porta COM aleatória.
 
 As configurações locais e a chave da IA ficam em
-`%LOCALAPPDATA%\\malta-central`, fora do clone do Git. As permissões de segredo usam as
+`%LOCALAPPDATA%\malta-central`, fora do clone do Git. As permissões de segredo usam as
 ACLs do perfil de usuário do Windows; os modos POSIX `0600` não se aplicam ao NTFS.
 
 ### Limite da compatibilidade Windows

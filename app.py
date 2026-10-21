@@ -126,12 +126,21 @@ def serial_port_candidates(platform_name: str | None = None, ports=None,
     if platform_name in ("nt", "win32", "windows"):
         com_ports = [device for device in discovered
                      if re.fullmatch(r"COM\d+", device, re.IGNORECASE)]
+        # Uma porta Bluetooth pode conter a palavra "Serial" na descrição;
+        # isso não a torna o console USB do telefone.
         usb_serial = [
             device for device in com_ports
-            if any(token in discovered[device]
-                   for token in ("usb", "cdc", "acm", "serial", "motorola", "malta"))
+            if "bluetooth" not in discovered[device]
+            and any(token in discovered[device]
+                    for token in ("usb", "cdc", "acm", "serial", "motorola", "malta", "vid:pid"))
         ]
-        selected = usb_serial if usb_serial else (com_ports if len(com_ports) == 1 else [])
+        if usb_serial:
+            selected = usb_serial
+        elif len(com_ports) == 1 and "bluetooth" not in discovered[com_ports[0]]:
+            selected = com_ports
+        else:
+            # Com várias COM genéricas, não adivinhar: permita MC_SERIAL_PORT.
+            selected = []
         return sorted(unique(selected), key=sort_key)
 
     preferred = [
