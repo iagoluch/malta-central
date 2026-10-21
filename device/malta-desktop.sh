@@ -1,9 +1,15 @@
 #!/bin/sh
 # Controle do Malta Desktop no aparelho (Alpine armv7, root).
 #
-# Sobe o Xvnc em :1, publica o VNC em 10.55.0.2:5901 pelo socat e mantém a
-# sessão X (openbox, tint2, pcmanfm) dentro do chroot em
+# Sobe o Xvnc em :1 escutando direto na interface USB (10.55.0.2:5901) e
+# mantém a sessão X (openbox, tint2, pcmanfm) dentro do chroot em
 # /data/malta-desktop/root.
+#
+# O Xvnc usa -interface $RNDIS_IP, e nao -localhost: neste aparelho (TigerVNC
+# 1.16) o -localhost (createLocalTcpListeners) nao devolve endereco/porta e o
+# Xvnc aborta com "No path or port configured for incoming connections"; com
+# -interface (createTcpListeners) o mesmo Xvnc sobe em 10.55.0.2:5901. Sem
+# proxy: o VNC fica preso a interface USB.
 #
 # Os processos nascem dentro do chroot; o chroot faz exec, então a linha de
 # comando não carrega o prefixo do caminho. A identificação usa
@@ -14,25 +20,25 @@
 # /data/malta-desktop/run/desktop.status (STATE/TS/ERROR).
 #
 # Contrato do status: STATE ∈ {stopped, starting, running, degraded, error};
-# INSTALLED, X_READY, DATA e RNDIS são booleanos 1|0. A ausência do desktop é
-# dita por INSTALLED=0 (com STATE=stopped), não por um estado fora da lista.
+# INSTALLED, X_READY, DATA e RNDIS são booleanos 1|0. A ausencia do desktop e
+# dita por INSTALLED=0 (com STATE=stopped). SOCAT_PID continua no contrato e
+# vale sempre 0 (nao ha proxy); o PC ainda exige SOCAT_PID != 0 na prontidao.
 #
-# Contrato da versão: VERSION é o conteúdo de /data/malta-desktop/version, que
-# o install.sh grava com o md5 do próprio install.sh instalado. A fonte da
-# verdade do bundle é esse arquivo: o PC compara o valor com o md5 do
-# device/install.sh local e reinstala quando divergem.
+# Contrato da versão: VERSION é o md5 do install.sh instalado (gravado em
+# /data/malta-desktop/version). O PC compara com o md5 do device/install.sh
+# local e reinstala quando divergem.
 #
 # Contrato do measure: uma linha "PROC=<nome> RSS_KB=<n> PSS_KB=<n>" por
-# processo do desktop (Xvnc, socat, openbox, tint2, pcmanfm, xterm). Processo
-# que não existe não imprime linha.
+# processo do desktop (Xvnc, openbox, tint2, pcmanfm, xterm); processo que
+# não existe não imprime linha.
 #
 # A senha VNC fica em /data/malta-desktop/vncpasswd (8 bytes, VncAuth) e é
 # sincronizada para /root/.vnc/passwd do chroot a cada start, porque o chroot
 # não enxerga /data/malta-desktop diretamente.
 #
 # O menu de aplicativos é o jgmenu (painel e Alt+F2); o menu do openbox
-# (menu.xml, gerado pelo install.sh) é aberto por Alt+F1 — o clique direito
-# não chega ao openbox, porque o pcmanfm ocupa a root window.
+# (menu.xml) é aberto por Alt+F1 — o clique direito não chega ao openbox,
+# porque o pcmanfm ocupa a root window.
 
 set -u
 
@@ -47,7 +53,6 @@ LOG=$LOGS/desktop.log
 LOCK=$RUN/desktop.lock
 STATUS=$RUN/desktop.status
 XVNC_PID_FILE=$RUN/xvnc.pid
-SOCAT_PID_FILE=$RUN/socat.pid
 SESSION_PID_FILE=$RUN/session.pid
 DESKTOP_PID_FILE=$RUN/desktop.pid
 BASELINE=$RUN/mem.baseline
@@ -64,16 +69,17 @@ RNDIS_DEV=rndis0
 RNDIS_IP=10.55.0.2
 VNC_PORT=5901
 X_WAIT=8
+XSET_TIMEOUT=5
+# Argumentos do Xvnc: ele escuta direto na interface USB (-interface), e nao
+# em loopback (-localhost aborta neste aparelho).
+XVNC_ARGS="-geometry $X_GEOMETRY -depth $X_DEPTH -rfbport $VNC_PORT -rfbauth /root/.vnc/passwd -SecurityTypes VncAuth -interface $RNDIS_IP"
 STOP_WAIT=3
 SESSION_WAIT=5
 MIN_FREE_KB=20480
 
-# Vocabulario de STATE do contrato com o app (malta_desktop_core.py): o
-# desktop conhece apenas estes cinco valores.
-#   stopped  - desktop parado
-#   starting - start em andamento
-#   running  - X, VNC e sessao no ar
-#   degraded - componentes parciais (X ou VNC sem o desktop completo)
+# Vocabulario de STATE do contrato com o app (malta_desktop_core.py):
+#   stopped  - desktop parado          starting - start em andamento
+#   running  - X, VNC e sessao no ar   degraded - componentes parciais
 #   error    - erro persistido em run/desktop.status
 ST_STOPPED=stopped
 ST_STARTING=starting
@@ -85,25 +91,22 @@ ST_ERROR=error
 BOOL_ON=1
 BOOL_OFF=0
 
-# O Xvnc e os programas do chroot usam /root como HOME; o host não precisa do
-# valor original para nada aqui.
+# O Xvnc e os programas do chroot usam /root como HOME.
 HOME=/root
 export HOME
 
-# Padrões de linha de comando aceitos. Só processos com /proc/<pid>/root igual
-# a $CHROOT e cmdline que caia em um destes padrões é tratado como nosso.
-#
-# A lista é separada por ESPAÇO e percorrida padrão a padrão: um "|" dentro de
-# uma variável não vira alternância do case, e a lista inteira seria
-# comparada como um único padrão (nunca casava: Xvnc e socat ficavam vivos).
+# Padrões de linha de comando aceitos: só processos com /proc/<pid>/root igual
+# a $CHROOT e cmdline que caia num destes padrões. A lista é separada por
+# ESPAÇO e percorrida padrão a padrão (um "|" não vira alternância do case).
+# O socat fica na lista para o stop derrubar o proxy do bundle antigo.
 DESKTOP_PATTERNS='/usr/bin/Xvnc* /usr/bin/socat* *malta-session* /usr/bin/openbox* /usr/bin/tint2* /usr/bin/pcmanfm* /usr/bin/xterm* /usr/bin/xsetroot* /usr/bin/setxkbmap* /usr/bin/xkbcomp*'
 
-REQUIRED_BINS="/usr/bin/Xvnc /usr/bin/socat /usr/local/bin/malta-session /usr/bin/openbox /usr/bin/tint2 /usr/bin/pcmanfm /usr/bin/xterm /usr/bin/jgmenu_run"
+REQUIRED_BINS="/usr/bin/Xvnc /usr/local/bin/malta-session /usr/bin/openbox /usr/bin/tint2 /usr/bin/pcmanfm /usr/bin/xterm /usr/bin/jgmenu_run"
 REQUIRED_CONFIGS="/etc/xdg/openbox/rc.xml /etc/xdg/openbox/menu.xml /etc/xdg/tint2/tint2rc /etc/xdg/pcmanfm/default/pcmanfm.conf /etc/xdg/jgmenu/jgmenurc"
 
 usage() {
     printf 'Uso: %s <comando> [args]\n' "$0"
-    printf '  start                sobe Xvnc, socat e a sessão (idempotente)\n'
+    printf '  start                sobe Xvnc e a sessao (idempotente)\n'
     printf '  stop                 encerra tudo e limpa socket/lock\n'
     printf '  restart              stop seguido de start\n'
     printf '  status               estado atual em chaves KEY=VALOR\n'
@@ -214,8 +217,8 @@ pid_alive() {
         ''|*[!0-9]*) return 1 ;;
     esac
     [ -r "/proc/$1/stat" ] || return 1
-    # O campo "state" vem depois do nome do processo, entre parenteses. Ler o
-    # arquivo com o "read" do shell evita um processo extra por consulta.
+    # O campo "state" vem depois do nome do processo: o "read" do shell evita
+    # um processo extra por consulta.
     pa_line=
     read -r pa_line <"/proc/$1/stat" 2>/dev/null
     [ -n "$pa_line" ] || return 1
@@ -232,18 +235,24 @@ pid_cmdline() {
     tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null
 }
 
+# Casa o cmdline do processo com a lista de padrões (mesma regra do
+# scan_pids: um padrão por vez, sem alternância do case).
 pid_matches() {
     pm_cmd=$(pid_cmdline "$1")
-    case "$pm_cmd" in
-        $2) return 0 ;;
-    esac
+    [ -n "$pm_cmd" ] || return 1
+    set -f
+    for pm_pat in $2; do
+        case "$pm_cmd" in
+            $pm_pat) set +f; return 0 ;;
+        esac
+    done
+    set +f
     return 1
 }
 
-# Cache da varredura de /proc: um único passe por invocação do script. status
-# e measure consultam os mesmos processos várias vezes; sem o cache cada
-# chamada pagaria a varredura de novo (dois processos por PID). O cache é
-# invalidado quando o script cria ou encerra algo.
+# Cache da varredura de /proc: um único passe por invocação (status e measure
+# consultam os mesmos processos várias vezes). Invalidado quando o script cria
+# ou encerra algo.
 SCAN_CACHE=
 SCAN_READY=0
 
@@ -263,11 +272,9 @@ scan_all() {
 }
 
 # Varredura sem /proc/<pid>/cmdline prefixado: só casa o que está no chroot.
-# A lista de padrões é percorrida um a um (o padrão chega em $1).
-#
-# "set -f" durante o laço: os curingas da lista são padrões do case, não
-# nomes de arquivo. Sem isso, "/usr/bin/socat*" seria expandido contra o
-# diretório atual e o processo ficaria de fora da lista.
+# "set -f" durante o laço: os curingas da lista são padrões do case, não nomes
+# de arquivo (sem isso "/usr/bin/socat*" seria expandido contra o diretório
+# atual e o processo ficaria de fora da lista).
 scan_pids() {
     scan_all
     set -f
@@ -302,8 +309,27 @@ component_pid() {
     printf '%s\n' "$cp_pid"
 }
 
-# Publica o processo em segundo plano e imprime o PID. stdout/stderr vão para
-# o log e stdin é /dev/null para o processo não segurar o chamador do app.
+# Descobre o pid real do Xvnc: o setsid faz fork quando o processo é líder de
+# grupo (o shell do console é interativo) e o "$!" do spawn é o pid do pai,
+# que sai na hora. Quem vale é o processo do /proc.
+xvnc_pid() {
+    xp_fallback=${1:-}
+    xp_try=0
+    while [ "$xp_try" -lt 2 ]; do
+        SCAN_READY=0
+        xp_pid=$(scan_pids '/usr/bin/Xvnc*' | head -n 1)
+        [ -n "$xp_pid" ] && {
+            printf '%s\n' "$xp_pid"
+            return 0
+        }
+        xp_try=$((xp_try + 1))
+        [ "$xp_try" -lt 2 ] && nap
+    done
+    [ -n "$xp_fallback" ] || return 1
+    printf '%s\n' "$xp_fallback"
+}
+
+# Publica o processo em segundo plano e imprime o PID (stdin /dev/null).
 spawn() {
     if command -v setsid >/dev/null 2>&1; then
         setsid "$@" </dev/null >>"$LOG" 2>&1 &
@@ -316,7 +342,7 @@ spawn() {
 }
 
 desktop_installed() {
-    [ -x "$CHROOT/usr/bin/Xvnc" ] && [ -x "$CHROOT/usr/bin/socat" ] &&
+    [ -x "$CHROOT/usr/bin/Xvnc" ] &&
         [ -f "$CHROOT/usr/local/bin/malta-session" ]
 }
 
@@ -361,20 +387,37 @@ sync_vncpasswd() {
 }
 
 x_ready() {
-    chroot "$CHROOT" /usr/bin/xset -display "$DISPLAY_NUM" q >/dev/null 2>&1
+    xr_wait=${1:-$XSET_TIMEOUT}
+    [ "$xr_wait" -gt "$XSET_TIMEOUT" ] && xr_wait=$XSET_TIMEOUT
+    # O xset sem prazo trava a serial: com um socket X obsoleto (servidor
+    # morto) ele bloqueia por minutos e o console fica ocupado. O timeout
+    # corta a espera; saida != 0 = "o X nao responde".
+    timeout "$xr_wait" chroot "$CHROOT" /usr/bin/xset -display "$DISPLAY_NUM" q \
+        >/dev/null 2>&1
 }
 
 # Espera o X responder por xset, no máximo X_WAIT segundos. Se o Xvnc morrer,
-# devolve 1 na hora para o chamador decidir o retry.
+# devolve 1 na hora para o chamador decidir o retry. Cada tentativa consome
+# no máximo o que sobra do X_WAIT.
 wait_x() {
     wx_pid=${1:-}
     wx_end=$(( $(now) + X_WAIT ))
     while :; do
-        x_ready && return 0
+        wx_left=$(( wx_end - $(now) ))
+        [ "$wx_left" -gt 0 ] || return 1
+        x_ready "$wx_left" && return 0
         pid_in_chroot "$wx_pid" || return 1
-        [ "$(now)" -lt "$wx_end" ] || return 1
         nap
     done
+}
+
+# A porta 5901 ocupada: o desktop anterior não foi encerrado. Subir um Xvnc
+# nessa situação falha de forma obscura ("address already in use").
+vnc_port_busy() {
+    tcp_listening "$RNDIS_IP" "$VNC_PORT" && return 0
+    tcp_listening "127.0.0.1" "$VNC_PORT" && return 0
+    tcp_listening "0.0.0.0" "$VNC_PORT" && return 0
+    return 1
 }
 
 start_xvnc() {
@@ -383,40 +426,30 @@ start_xvnc() {
         return 0
     }
     rm -f "$XVNC_PID_FILE"
+    if vnc_port_busy; then
+        fail "a porta $VNC_PORT já está em uso; o desktop anterior pode não ter sido encerrado (rode stop)"
+    fi
     cleanup_x_socket
-    sx_pid=$(spawn chroot "$CHROOT" /usr/bin/Xvnc "$DISPLAY_NUM" -geometry "$X_GEOMETRY" \
-        -depth "$X_DEPTH" -rfbport "$VNC_PORT" -rfbauth /root/.vnc/passwd \
-        -SecurityTypes VncAuth -localhost)
+    sx_spawn=$(spawn chroot "$CHROOT" /usr/bin/Xvnc "$DISPLAY_NUM" $XVNC_ARGS)
+    sx_pid=$(xvnc_pid "$sx_spawn")
     printf '%s\n' "$sx_pid" >"$XVNC_PID_FILE"
     if wait_x "$sx_pid"; then
-        say "Xvnc ativo (pid $sx_pid) em $DISPLAY_NUM $X_GEOMETRY"
+        say "Xvnc ativo (pid $sx_pid) em $DISPLAY_NUM $X_GEOMETRY (VNC em $RNDIS_IP:$VNC_PORT)"
         return 0
     fi
     if pid_in_chroot "$sx_pid"; then
         fail "Xvnc está vivo (pid $sx_pid) mas não respondeu em $DISPLAY_NUM; veja $LOG"
     fi
+    if vnc_port_busy; then
+        fail "a porta $VNC_PORT já está em uso; o desktop anterior pode não ter sido encerrado (rode stop)"
+    fi
     say "Xvnc encerrou na primeira tentativa; repetindo com -extension GLX"
     cleanup_x_socket
-    sx_pid=$(spawn chroot "$CHROOT" /usr/bin/Xvnc "$DISPLAY_NUM" -geometry "$X_GEOMETRY" \
-        -depth "$X_DEPTH" -rfbport "$VNC_PORT" -rfbauth /root/.vnc/passwd \
-        -SecurityTypes VncAuth -localhost -extension GLX)
+    sx_spawn=$(spawn chroot "$CHROOT" /usr/bin/Xvnc "$DISPLAY_NUM" $XVNC_ARGS -extension GLX)
+    sx_pid=$(xvnc_pid "$sx_spawn")
     printf '%s\n' "$sx_pid" >"$XVNC_PID_FILE"
     wait_x "$sx_pid" || fail "Xvnc não respondeu em $DISPLAY_NUM após duas tentativas; veja $LOG"
     say "Xvnc ativo (pid $sx_pid) em $DISPLAY_NUM $X_GEOMETRY (GLX desativado)"
-}
-
-start_socat() {
-    ss_pid=$(component_pid "$SOCAT_PID_FILE" '/usr/bin/socat*') && {
-        say "socat já ativo (pid $ss_pid)"
-        return 0
-    }
-    rm -f "$SOCAT_PID_FILE"
-    ss_pid=$(spawn chroot "$CHROOT" /usr/bin/socat \
-        "TCP-LISTEN:$VNC_PORT,bind=$RNDIS_IP,reuseaddr,fork" "TCP:127.0.0.1:$VNC_PORT")
-    printf '%s\n' "$ss_pid" >"$SOCAT_PID_FILE"
-    nap
-    pid_in_chroot "$ss_pid" || fail "socat não permaneceu ativo (bind $RNDIS_IP:$VNC_PORT); veja $LOG"
-    say "socat ativo (pid $ss_pid) em $RNDIS_IP:$VNC_PORT"
 }
 
 session_pid() {
@@ -424,8 +457,7 @@ session_pid() {
 }
 
 # A sessão publica os PIDs em /tmp/malta-session.pids; o pcmanfm é o marco de
-# "desktop pronto". Se o shell da sessão morrer, start falha; se apenas
-# demorar, avisa e segue (X e VNC já estão de pé).
+# "desktop pronto". Se a sessão morrer, start falha; se demorar, avisa e segue.
 wait_session() {
     ws_pid=$1
     ws_end=$(( $(now) + SESSION_WAIT ))
@@ -468,8 +500,10 @@ cmd_start() {
 
     scan_all
     start_xvnc
-    start_socat
+    # O Xvnc nasceu depois da varredura: o cache de /proc ficou velho.
+    SCAN_READY=0
     start_session
+    SCAN_READY=0
 
     set_status "$ST_RUNNING" ""
     say "Malta Desktop ativo: VNC em $RNDIS_IP:$VNC_PORT ($RESOLUTION)"
@@ -520,6 +554,15 @@ stop_components() {
     for sc_pid in $sc_left; do
         pid_alive "$sc_pid" && sc_live="$sc_live $sc_pid"
     done
+    # O stop é a garantia de que nenhum processo do desktop fica órfão. O
+    # Xvnc é conferido primeiro: é ele que segura a porta 5901 e faz o
+    # próximo start falhar de forma obscura.
+    SCAN_READY=0
+    sx_left=
+    for sx_pid in $(scan_pids '/usr/bin/Xvnc*'); do
+        pid_alive "$sx_pid" && sx_left="$sx_left $sx_pid"
+    done
+    [ -z "$sx_left" ] || fail "o Xvnc sobreviveu ao stop:$sx_left"
     [ -z "$sc_live" ] || fail "processos resistiram ao KILL:$sc_live"
     return 0
 }
@@ -561,7 +604,7 @@ cmd_stop() {
     stop_components
     SCAN_READY=0
     cleanup_x_socket
-    rm -f "$XVNC_PID_FILE" "$SOCAT_PID_FILE" "$SESSION_PID_FILE" "$DESKTOP_PID_FILE" \
+    rm -f "$XVNC_PID_FILE" "$SESSION_PID_FILE" "$DESKTOP_PID_FILE" \
         "$CHROOT/tmp/malta-session.pids"
     record_baseline
     set_status "$ST_STOPPED" ""
@@ -584,11 +627,9 @@ cmd_status() {
     st_rndis=$BOOL_OFF
     rndis_up && st_rndis=$BOOL_ON
     st_xvnc=0
-    st_socat=0
     st_xready=$BOOL_OFF
     if [ "$st_installed" = "$BOOL_ON" ]; then
         st_xvnc=$(component_pid "$XVNC_PID_FILE" '/usr/bin/Xvnc*') || st_xvnc=0
-        st_socat=$(component_pid "$SOCAT_PID_FILE" '/usr/bin/socat*') || st_socat=0
         x_ready && st_xready=$BOOL_ON
     fi
     st_persisted=$(status_field STATE)
@@ -602,10 +643,10 @@ cmd_status() {
         # "error" fica reservado ao erro persistido em run/desktop.status.
         st_state=$ST_ERROR
         st_err=$st_perr
-    elif [ "$st_xvnc" != 0 ] && [ "$st_socat" != 0 ] && [ "$st_xready" = "$BOOL_ON" ]; then
+    elif [ "$st_xvnc" != 0 ] && [ "$st_xready" = "$BOOL_ON" ]; then
         st_state=$ST_RUNNING
         st_err=
-    elif [ "$st_xvnc" = 0 ] && [ "$st_socat" = 0 ]; then
+    elif [ "$st_xvnc" = 0 ]; then
         st_state=$ST_STOPPED
         st_err=
     else
@@ -630,28 +671,24 @@ cmd_status() {
     printf 'DATA=%s\n' "$st_data"
     printf 'RNDIS=%s\n' "$st_rndis"
     printf 'XVNC_PID=%s\n' "$st_xvnc"
-    printf 'SOCAT_PID=%s\n' "$st_socat"
+    # O proxy saiu: o Xvnc escuta direto na interface USB. A chave continua
+    # no contrato (o PC a le) e vale sempre 0.
+    printf 'SOCAT_PID=0\n'
     printf 'X_READY=%s\n' "$st_xready"
     printf 'GEOMETRY=%s\n' "$X_GEOMETRY"
     printf 'VERSION=%s\n' "$st_version"
     printf 'ERROR=%s\n' "$st_err"
 }
 
-# Memoria dos processos: lida uma vez por PID e guardada em cache.
-#
-# O measure roda no limite de 15 s do /api/cmd do PC. No aparelho, ler o
-# smaps de um processo custa segundos (o kernel 4.9 nao tem smaps_rollup e o
-# fallback e o smaps inteiro): sem cache, o mesmo arquivo era lido de novo
-# para cada total e para cada linha PROC=.
-#
-# Cache: "pid:rss:pss" por processo, separados por espaco.
+# Memoria dos processos: lida uma vez por PID e guardada em cache ("pid:rss:pss"
+# por processo). O measure roda no limite de 15 s do /api/cmd e o smaps de um
+# processo custa segundos no aparelho (kernel 4.9 sem smaps_rollup).
 MEM_CACHE=
 PM_RSS=0
 PM_PSS=0
 
-# Le o smaps de um processo e soma o PSS (KB). O smaps_rollup e preferido
-# (uma linha so); no smaps completo a soma das linhas "Pss:" das areas de
-# memoria da o total do processo.
+# Le o smaps de um processo e soma o PSS (KB): o smaps_rollup e preferido (uma
+# linha so); no smaps completo, soma as linhas "Pss:".
 read_smaps_pss() {
     rp_pid=$1
     if [ -r "/proc/$rp_pid/smaps_rollup" ]; then
@@ -687,12 +724,10 @@ read_status_rss() {
     return 0
 }
 
-# RSS e PSS de um processo, lidos uma unica vez por PID.
-#
-# O cache vem primeiro: o segundo pedido do mesmo PID (os totais e a linha
-# PROC=) sai de memoria, sem tocar no /proc. Devolve 1 quando o processo nao
-# existe: quem chama omite a linha em vez de reportar 0 KB. O cache vive no
-# shell: quem chama roda no mesmo shell (um subshell perderia o cache).
+# RSS e PSS de um processo, lidos uma unica vez por PID (o cache vem primeiro:
+# o segundo pedido do mesmo PID sai de memoria). Devolve 1 quando o processo
+# nao existe: quem chama omite a linha em vez de reportar 0 KB. O cache vive
+# no shell: um subshell perderia o cache.
 mem_proc_kb() {
     mp_pid=${1:-}
     case "$mp_pid" in
@@ -731,7 +766,6 @@ session_pid_field() {
 
 # Uma linha por processo do desktop: o app mostra o nome direto na tela.
 # Processo ausente nao emite linha (0 seria lido como processo de 0 KB).
-# Os valores vem do cache: o smaps de cada PID ja foi lido.
 emit_proc() {
     ep_name=$1
     ep_pid=$2
@@ -760,12 +794,10 @@ cmd_measure() {
         [ "$mm_now" -gt 0 ] && printf '%s\n' "$mm_now" >"$BASELINE" 2>/dev/null
     fi
     mm_xvnc=$(component_pid "$XVNC_PID_FILE" '/usr/bin/Xvnc*') || mm_xvnc=0
-    mm_socat=$(component_pid "$SOCAT_PID_FILE" '/usr/bin/socat*') || mm_socat=0
     mm_sess=$(session_pid) || mm_sess=0
     mm_others=
     for mm_pid in $(desktop_pids); do
         [ "$mm_pid" = "$mm_xvnc" ] && continue
-        [ "$mm_pid" = "$mm_socat" ] && continue
         mm_others="$mm_others $mm_pid"
     done
     mm_total=$(meminfo_kb MemTotal)
@@ -786,20 +818,14 @@ cmd_measure() {
     # subshell perderia o cache).
     mm_xvnc_rss=0
     mm_xvnc_pss=0
-    mm_socat_rss=0
-    mm_socat_pss=0
     mm_sess_rss=0
     mm_sess_pss=0
-    for mm_pid in $mm_xvnc $mm_socat $mm_others; do
+    for mm_pid in $mm_xvnc $mm_others; do
         mem_proc_kb "$mm_pid" || continue
         case "$mm_pid" in
             "$mm_xvnc")
                 mm_xvnc_rss=$PM_RSS
                 mm_xvnc_pss=$PM_PSS
-                ;;
-            "$mm_socat")
-                mm_socat_rss=$PM_RSS
-                mm_socat_pss=$PM_PSS
                 ;;
             *)
                 mm_sess_rss=$((mm_sess_rss + PM_RSS))
@@ -807,8 +833,8 @@ cmd_measure() {
                 ;;
         esac
     done
-    mm_total_rss=$((mm_xvnc_rss + mm_socat_rss + mm_sess_rss))
-    mm_total_pss=$((mm_xvnc_pss + mm_socat_pss + mm_sess_pss))
+    mm_total_rss=$((mm_xvnc_rss + mm_sess_rss))
+    mm_total_pss=$((mm_xvnc_pss + mm_sess_pss))
     printf 'MEMTOTAL_KB=%s\n' "$mm_total"
     printf 'MEMAVAILABLE_KB=%s\n' "$mm_avail"
     printf 'BASELINE_MEMAVAILABLE_KB=%s\n' "$mm_base"
@@ -816,16 +842,12 @@ cmd_measure() {
     printf 'XVNC_PID=%s\n' "$mm_xvnc"
     printf 'XVNC_PSS_KB=%s\n' "$mm_xvnc_pss"
     printf 'XVNC_RSS_KB=%s\n' "$mm_xvnc_rss"
-    printf 'SOCAT_PID=%s\n' "$mm_socat"
-    printf 'SOCAT_PSS_KB=%s\n' "$mm_socat_pss"
-    printf 'SOCAT_RSS_KB=%s\n' "$mm_socat_rss"
     printf 'SESSION_PID=%s\n' "$mm_sess"
     printf 'SESSION_PSS_KB=%s\n' "$mm_sess_pss"
     printf 'SESSION_RSS_KB=%s\n' "$mm_sess_rss"
     printf 'TOTAL_PSS_KB=%s\n' "$mm_total_pss"
     printf 'TOTAL_RSS_KB=%s\n' "$mm_total_rss"
     emit_proc Xvnc "$mm_xvnc"
-    emit_proc socat "$mm_socat"
     emit_proc openbox "$(session_pid_field openbox)"
     emit_proc tint2 "$(session_pid_field tint2)"
     emit_proc pcmanfm "$(session_pid_field pcmanfm)"
@@ -942,13 +964,8 @@ cmd_doctor() {
         dr_fail x "$DISPLAY_NUM não responde a xset"
     fi
 
-    dr_socat=$(component_pid "$SOCAT_PID_FILE" '/usr/bin/socat*') || dr_socat=0
-    if [ "$dr_socat" != 0 ]; then
-        dr_pass socat
-    else
-        dr_fail socat "não está ativo (use start)"
-    fi
-
+    # O VNC e o proprio Xvnc, escutando na interface USB: nao ha proxy no
+    # meio. O teste e a porta 5901 escutando em $RNDIS_IP.
     if tcp_listening "$RNDIS_IP" "$VNC_PORT"; then
         dr_pass vnc
     else

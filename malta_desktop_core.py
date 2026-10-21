@@ -67,6 +67,16 @@ NOT_INSTALLED_EXIT = 127
 #: origem por 1200 s.
 TCP_FALLBACK_INTERVAL_S = 30.0
 
+#: Chave do status que diz que o Xvnc respondeu: o aparelho so a marca
+#: quando o ``xset`` responde dentro do prazo. E o sinal autoritativo de
+#: prontidao — o script novo nao tem proxy (o Xvnc escuta direto na
+#: interface USB, 10.55.0.2:5901) e o SOCAT_PID vale sempre 0.
+X_READY_KEY = "X_READY"
+#: Chave do status com o PID do proxy (socat) do script antigo. Continua no
+#: contrato (o PC a le para diagnostico) e vale sempre 0 no script novo: por
+#: isso ela nao pode ser criterio de prontidao.
+SOCAT_PID_KEY = "SOCAT_PID"
+
 STATUS_CMD = f"sh {DESKTOP_DIR}/malta-desktop.sh status"
 START_CMD = f"sh {DESKTOP_DIR}/malta-desktop.sh start"
 STOP_CMD = f"sh {DESKTOP_DIR}/malta-desktop.sh stop"
@@ -203,6 +213,17 @@ def _to_int(value) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _socat_running(data: dict) -> bool:
+    """O proxy (socat) do script antigo está de pé.
+
+    O script novo não tem proxy: o Xvnc escuta direto na interface USB
+    (10.55.0.2:5901) e o status reporta ``SOCAT_PID=0``. A chave continua no
+    contrato e serve de diagnóstico, mas só vira critério de prontidão nos
+    aparelhos com o script antigo — os que ainda não reportam ``X_READY``.
+    """
+    return (data.get(SOCAT_PID_KEY) or "").strip() not in ("", "0")
 
 
 def _urllib_transport(method: str, url: str, body: bytes | None,
@@ -865,50 +886,53 @@ class DesktopService:
     def device_signal_ready(self, device: dict | None = None) -> bool:
         """O aparelho diz que o desktop está de pé — sem abrir conexão.
 
-        O sinal é o status do próprio aparelho: STATE=running, X_READY=1 e
-        SOCAT_PID != 0. Nenhuma conexão TCP é aberta aqui: uma conexão que
-        morre antes do handshake chega ao Xvnc pelo socat e conta como falha
-        de login do 127.0.0.1 — o TigerVNC bloqueia o endereço por 1200 s e
-        o cliente legítimo (que chega pelo mesmo socat) é recusado.
+        O sinal é o status do próprio aparelho: ``STATE=running`` e
+        ``X_READY=1``. O ``X_READY`` é autoritativo: o aparelho só o marca
+        quando o ``xset`` responde dentro do prazo, e é o único sinal que
+        existe no script novo (o Xvnc escuta direto na interface USB e não
+        há proxy — o ``SOCAT_PID`` vale sempre 0 e por isso não decide
+        nada). Nenhuma conexão TCP é aberta aqui: uma conexão que morre
+        antes do handshake chega ao Xvnc e conta como falha de login do
+        127.0.0.1 — o TigerVNC bloqueia o endereço por 1200 s e o cliente
+        legítimo é recusado.
 
-        Aparelho com script antigo (sem X_READY no status) usa o melhor sinal
-        disponível: STATE=running com o socat de pé.
+        Aparelho com script antigo (sem ``X_READY`` no status) usa o critério
+        de sempre: ``STATE=running`` com o proxy de pé (``SOCAT_PID != 0``).
         """
         data = device if device is not None else self.device_status()
         if (data.get("STATE") or "").lower() != "running":
             return False
-        if (data.get("SOCAT_PID") or "").strip() in ("", "0"):
-            return False
-        if "X_READY" in data:
-            return data.get("X_READY") == "1"
-        return True
+        if X_READY_KEY in data:
+            return data.get(X_READY_KEY) == "1"
+        return _socat_running(data)
 
     def device_ready(self, device: dict | None = None, *,
                      session_alive: bool = False,
                      allow_tcp_fallback: bool = True) -> bool:
         """Verdadeiro quando o próprio aparelho diz que o desktop está no ar.
 
-        O sinal vem do status (STATE, X_READY e SOCAT_PID) e não de uma
-        conexão: abrir e fechar uma conexão TCP no 5901 chega ao Xvnc pelo
-        socat e morre antes do handshake — o TigerVNC conta isso como falha
-        de login do 127.0.0.1 e bloqueia o endereço por 1200 s, derrubando
-        o cliente legítimo que chega pelo mesmo socat. Pior: o socat
-        continuaria aceitando, e o app anunciaria "desktop respondendo"
-        com o VNC morto.
+        O sinal vem do status (``STATE`` e ``X_READY``) e não de uma
+        conexão: abrir e fechar uma conexão TCP no 5901 chega ao Xvnc e
+        morre antes do handshake — o TigerVNC conta isso como falha de
+        login do 127.0.0.1 e bloqueia o endereço por 1200 s, derrubando
+        o cliente legítimo. Pior: o proxy continuaria aceitando, e o app
+        anunciaria "desktop respondendo" com o VNC morto.
 
-        Só quando o status não traz X_READY (aparelho com script antigo) é
-        que a sonda TCP entra, e no máximo uma vez a cada 30 s. Quem não
-        pode sondar (o caminho de start) desliga a sonda com
-        ``allow_tcp_fallback=False``.
+        Com o script novo o ``X_READY`` é a resposta: o proxy sumiu (o
+        ``SOCAT_PID`` vale sempre 0) e ele é o único sinal que o aparelho
+        dá. Só quando o status não traz ``X_READY`` (aparelho com script
+        antigo) é que o proxy de pé vale como sinal e a sonda TCP entra, no
+        máximo uma vez a cada 30 s. Quem não pode sondar (o caminho de
+        start) desliga a sonda com ``allow_tcp_fallback=False``.
         """
         data = device if device is not None else self.device_status()
         if (data.get("STATE") or "").lower() != "running":
             return False
-        if "X_READY" in data:
-            return (
-                data.get("X_READY") == "1"
-                and (data.get("SOCAT_PID") or "").strip() not in ("", "0")
-            )
+        if X_READY_KEY in data:
+            return data.get(X_READY_KEY) == "1"
+        # Script antigo: sem X_READY, o proxy de pé é o sinal.
+        if not _socat_running(data):
+            return False
         if session_alive:
             # A sessão VNC viva é a prova mais forte de que o desktop está no
             # ar; e sondar agora seria arriscar o bloqueio do endereço.
@@ -1156,12 +1180,12 @@ class DesktopService:
     def ensure_running(self, report=None) -> DesktopState:
         """Garante bundle atual, instalação concluída e desktop de pé.
 
-        A prontidão vem do aparelho (STATE/X_READY/SOCAT_PID) e nunca de uma
+        A prontidão vem do aparelho (STATE/X_READY) e nunca de uma
         conexão TCP: uma conexão que morre antes do handshake chega ao Xvnc
-        pelo socat e conta como falha de login do 127.0.0.1 — o TigerVNC
-        bloqueia o endereço por 1200 s e o cliente legítimo, que chega pelo
-        mesmo socat, é recusado. Quem prova que o PC alcança o 5901 é o
-        cliente RFB real: ele autentica e nunca conta como falha.
+        e conta como falha de login do 127.0.0.1 — o TigerVNC bloqueia o
+        endereço por 1200 s e o cliente legítimo é recusado. Quem prova que
+        o PC alcança o 5901 é o cliente RFB real: ele autentica e nunca
+        conta como falha.
         """
         report = report or self.log
         # A comparação é entre a assinatura do instalador local e a que o

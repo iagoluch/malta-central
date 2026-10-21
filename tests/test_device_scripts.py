@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -186,6 +187,12 @@ def read_script(name: str) -> str:
     return (DEVICE / name).read_text(encoding="utf-8")
 
 
+def code_only(text: str) -> str:
+    """O script sem os comentarios: o que o shell executa de verdade."""
+    return "\n".join(linha for linha in text.splitlines()
+                     if not linha.lstrip().startswith("#"))
+
+
 def read_config(name: str) -> str:
     return (CONFIG / name).read_text(encoding="utf-8")
 
@@ -212,7 +219,8 @@ STATE_VOCABULARY = {"stopped", "starting", "running", "degraded", "error"}
 BOOLEAN_KEYS = ("INSTALLED", "X_READY", "DATA", "RNDIS")
 
 # Processos que o measure deve relatar, com o nome que o app mostra na tela.
-MEASURE_PROCESSES = ("Xvnc", "socat", "openbox", "tint2", "pcmanfm", "xterm")
+# O proxy socat saiu: o Xvnc escuta direto na interface USB.
+MEASURE_PROCESSES = ("Xvnc", "openbox", "tint2", "pcmanfm", "xterm")
 
 # Valores sinteticos dos agregados do measure. O formato das linhas vem do
 # device (fonte); so os numeros sao inventados aqui.
@@ -224,9 +232,6 @@ MEASURE_VALUES = {
     "XVNC_PID": "101",
     "XVNC_PSS_KB": "5000",
     "XVNC_RSS_KB": "8000",
-    "SOCAT_PID": "102",
-    "SOCAT_PSS_KB": "900",
-    "SOCAT_RSS_KB": "1500",
     "SESSION_PID": "103",
     "SESSION_PSS_KB": "7000",
     "SESSION_RSS_KB": "11000",
@@ -256,6 +261,17 @@ def shell_block(text: str, name: str) -> str:
     """Corpo de uma funcao do script, do "nome() {" ate o "}" da coluna 0."""
     match = re.search(rf"^{re.escape(name)}\(\) \{{\n(.*?)^\}}", text, re.S | re.M)
     return match.group(1) if match else ""
+
+
+def shell_functions(text: str, names: list[str]) -> str:
+    """As funcoes do script prontas para rodar isoladas (com definicao)."""
+    partes = []
+    for nome in names:
+        corpo = shell_block(text, nome)
+        if not corpo:
+            raise AssertionError(f"funcao {nome} nao encontrada no script")
+        partes.append(f"{nome}() {{\n{corpo}\n}}")
+    return "\n".join(partes)
 
 
 def run_shell_function(text: str, name: str, args: list[str]) -> str:
@@ -308,8 +324,7 @@ def fake_installed_root(base: Path) -> None:
     O shebang e o que faz o MSYS (Git Bash) tratar o arquivo como executavel;
     no NTFS nao ha bit de execucao.
     """
-    for relative in ("root/usr/bin/Xvnc", "root/usr/bin/socat",
-                     "root/usr/local/bin/malta-session"):
+    for relative in ("root/usr/bin/Xvnc", "root/usr/local/bin/malta-session"):
         path = base / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"#!/bin/sh\nexit 0\n")
@@ -441,11 +456,14 @@ class DeviceScriptTests(unittest.TestCase):
         required = {
             "alpine-baselayout", "busybox", "openbox", "tint2", "jgmenu",
             "pcmanfm", "xterm", "font-dejavu", "hicolor-icon-theme", "tigervnc",
-            "socat", "xset", "xsetroot", "setxkbmap", "xkeyboard-config",
+            "xset", "xsetroot", "setxkbmap", "xkeyboard-config",
             "xkbcomp",
         }
         self.assertTrue(required <= packages,
                         f"faltaram pacotes: {sorted(required - packages)}")
+        # O proxy saiu: o Xvnc escuta direto na interface USB e nao ha
+        # pacote socat no chroot.
+        self.assertNotIn("socat", packages)
 
     def test_install_script_derives_alpine_branch(self):
         text = read_script("install.sh")
@@ -483,8 +501,7 @@ class DeviceScriptTests(unittest.TestCase):
 
     def test_desktop_script_uses_pid_files(self):
         text = read_script("malta-desktop.sh")
-        for name in ("XVNC_PID_FILE", "SOCAT_PID_FILE", "SESSION_PID_FILE",
-                     "DESKTOP_PID_FILE"):
+        for name in ("XVNC_PID_FILE", "SESSION_PID_FILE", "DESKTOP_PID_FILE"):
             self.assertIn(name, text)
         self.assertIn(".pid", text)
 
@@ -503,11 +520,161 @@ class DeviceScriptTests(unittest.TestCase):
         self.assertIn("setsid", read_script("malta-desktop.sh"))
 
     def test_desktop_script_binds_vnc_to_rndis_only(self):
+        """O VNC escuta na interface USB (10.55.0.2), nunca em loopback.
+
+        Medido no aparelho: o Xvnc com -localhost aborta ("vncExtInit: No
+        path or port configured for incoming connections"), porque o
+        createLocalTcpListeners() nao devolve endereco/porta neste ambiente.
+        Com -interface (createTcpListeners) o mesmo Xvnc sobe e escuta em
+        10.55.0.2:5901.
+        """
         text = read_script("malta-desktop.sh")
+        codigo = code_only(text)
         self.assertIn("RNDIS_IP=10.55.0.2", text)
-        self.assertIn("bind=$RNDIS_IP", text)
-        self.assertNotIn("0.0.0.0", text,
-                         "o proxy socat nao pode escutar em 0.0.0.0")
+        self.assertIn("-interface $RNDIS_IP", codigo)
+        self.assertNotIn("-localhost", codigo)
+        self.assertNotIn("0.0.0.0", codigo.replace('tcp_listening "0.0.0.0"', ""),
+                         "o VNC nao pode escutar em 0.0.0.0")
+
+    def test_desktop_script_does_not_start_a_proxy(self):
+        """Sem proxy: o Xvnc escuta direto na interface USB."""
+        text = read_script("malta-desktop.sh")
+        self.assertNotIn("start_socat", text)
+        self.assertNotIn("TCP-LISTEN", text)
+        self.assertNotIn("/usr/bin/socat \\", text)
+
+    def test_status_keeps_the_socat_key_with_zero(self):
+        """A chave continua no contrato do PC; sem proxy, ela vale 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fake_installed_root(base)
+            output = run_device("status", base)
+        device = core.parse_kv(output)
+        self.assertIn("SOCAT_PID", device)
+        self.assertEqual(device["SOCAT_PID"], "0")
+
+    def test_doctor_checks_the_vnc_port_on_the_usb_interface(self):
+        """O doctor confere a porta 5901 escutando em 10.55.0.2."""
+        doctor = shell_block(read_script("malta-desktop.sh"), "cmd_doctor")
+        self.assertIn('tcp_listening "$RNDIS_IP" "$VNC_PORT"', doctor)
+        self.assertNotIn("socat", doctor)
+
+    def test_x_ready_has_a_deadline(self):
+        """O xset sem prazo trava a serial por minutos (medido no aparelho)."""
+        bloco = shell_block(read_script("malta-desktop.sh"), "x_ready")
+        self.assertIn("timeout", bloco)
+        self.assertIn("chroot", bloco)
+        wait = shell_block(read_script("malta-desktop.sh"), "wait_x")
+        self.assertIn("X_WAIT", wait)
+        self.assertIn("x_ready", wait)
+
+    @unittest.skipUnless(BASH, "bash nao encontrado nesta maquina")
+    def test_x_ready_gives_up_when_the_x_server_does_not_answer(self):
+        """Socket X obsoleto: o xset bloqueia e a serial fica ocupada.
+
+        O chroot de mentira fica esperando como o xset travado; o timeout
+        tem de cortar a espera e devolver "o X nao responde".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "chroot").write_text("#!/bin/sh\nsleep 30\n",
+                                            encoding="utf-8", newline="\n")
+            corpo = shell_functions(read_script("malta-desktop.sh"), ("x_ready",))
+            # O PATH do Git Bash e remontado no inicio da sessao: o chroot de
+            # mentira entra no proprio comando.
+            corpo = corpo.replace("chroot ", f'"{msys_path(bin_dir / "chroot")}" ')
+            script = base / "x_ready.sh"
+            script.write_text(
+                "set -u\n"
+                "CHROOT=/data/malta-desktop/root\n"
+                "DISPLAY_NUM=:1\n"
+                "XSET_TIMEOUT=5\n"
+                f"{corpo}\n"
+                "x_ready\n"
+                "echo rc=$?\n",
+                encoding="utf-8", newline="\n")
+            env = dict(os.environ)
+            env["PATH"] = bin_dir.as_posix() + os.pathsep + env["PATH"]
+            inicio = time.time()
+            resultado = subprocess.run(
+                [BASH, script.as_posix()], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", env=env, timeout=60)
+            decorrido = time.time() - inicio
+        self.assertIn("rc=124", resultado.stdout,
+                      f"o xset nao foi interrompido: {resultado.stdout}")
+        self.assertLess(decorrido, 20,
+                         f"o x_ready levou {decorrido:.1f} s: a serial trava")
+
+    def test_pid_matches_accepts_a_list_of_patterns(self):
+        """A lista de padrões é separada por espaço: o case tem de iterar.
+
+        O padrao tem de casar com o cmdline real do processo
+        ("/usr/bin/Xvnc :1 -geometry 1024x600 ...").
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            proc = base / "fakeproc"
+            (proc / "101").mkdir(parents=True)
+            (proc / "101" / "cmdline").write_bytes(
+                b"/usr/bin/Xvnc :1 -geometry 1024x600 -depth 16\0")
+            texto = read_script("malta-desktop.sh")
+            corpo = shell_functions(texto, ("pid_cmdline", "pid_matches"))
+            corpo = corpo.replace("/proc/", proc.as_posix() + "/")
+            script = base / "pid_matches.sh"
+            script.write_text(
+                "set -u\n"
+                f"{corpo}\n"
+                "pid_matches 101 '/usr/bin/socat* /usr/bin/Xvnc*'\n"
+                "echo rc=$?\n",
+                encoding="utf-8", newline="\n")
+            resultado = subprocess.run(
+                [BASH, script.as_posix()], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60)
+        self.assertIn("rc=0", resultado.stdout,
+                      f"a lista de padrões nao casou: {resultado.stdout}")
+
+    def test_start_xvnc_reports_the_busy_port(self):
+        """Porta 5901 ocupada: o start diz isso em vez de falhar obscuro."""
+        bloco = shell_block(read_script("malta-desktop.sh"), "start_xvnc")
+        self.assertIn("vnc_port_busy", bloco)
+        self.assertIn("já está em uso", bloco)
+
+    @unittest.skipUnless(BASH, "bash nao encontrado nesta maquina")
+    def test_vnc_port_busy_sees_the_port_in_use(self):
+        """A porta 5901 escutando em 10.55.0.2 precisa ser vista."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            proc = base / "fakeproc"
+            (proc / "net").mkdir(parents=True)
+            tcp = proc / "net" / "tcp"
+            texto = read_script("malta-desktop.sh")
+            corpo = shell_functions(texto, ("hex_addr", "tcp_listening",
+                                             "vnc_port_busy"))
+            corpo = corpo.replace("/proc/", proc.as_posix() + "/")
+            script = base / "port.sh"
+            script.write_text(
+                "set -u\n"
+                "RNDIS_IP=10.55.0.2\n"
+                "VNC_PORT=5901\n"
+                f"{corpo}\n"
+                "vnc_port_busy\necho busy=$?\n",
+                encoding="utf-8", newline="\n")
+            tcp.write_text("", encoding="utf-8")
+            livre = subprocess.run(
+                [BASH, script.as_posix()], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60)
+            tcp.write_text(
+                "   0: 0200370A:170D 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000  0 0 0 0\n", encoding="utf-8")
+            ocupado = subprocess.run(
+                [BASH, script.as_posix()], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60)
+        self.assertIn("busy=1", livre.stdout,
+                      f"a porta livre foi vista como ocupada: {livre.stdout}")
+        self.assertIn("busy=0", ocupado.stdout,
+                      f"a porta ocupada nao foi vista: {ocupado.stdout}")
 
     # -- session.sh -----------------------------------------------------
 
@@ -1218,19 +1385,26 @@ def msys_path(path: Path) -> str:
     return texto
 
 
-def stub_kill(bin_dir: Path) -> None:
-    """Cria um "kill" de mentira: o processo morre com o stat apagado."""
+def stub_kill(bin_dir: Path, mata: bool = True) -> None:
+    """Cria um "kill" de mentira: o processo morre com o stat apagado.
+
+    Com mata=False, ninguem morre: e o cenario do stop que precisa
+    desconfiar de um processo que sobreviveu.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
     script = bin_dir / "kill"
-    script.write_text(
-        '#!/bin/sh\n'
-        'for arg in "$@"; do\n'
-        '    case "$arg" in -*) continue ;; esac\n'
-        '    rm -f "$FAKE_PROC/$arg/stat" 2>/dev/null\n'
-        'done\n'
-        'exit 0\n',
-        encoding="utf-8", newline="\n",
-    )
+    if mata:
+        script.write_text(
+            '#!/bin/sh\n'
+            'for arg in "$@"; do\n'
+            '    case "$arg" in -*) continue ;; esac\n'
+            '    rm -f "$FAKE_PROC/$arg/stat" 2>/dev/null\n'
+            'done\n'
+            'exit 0\n',
+            encoding="utf-8", newline="\n",
+        )
+    else:
+        script.write_text('#!/bin/sh\nexit 0\n', encoding="utf-8", newline="\n")
 
 
 def run_with_fake_proc(command: str, base: Path, proc: Path, bin_dir: Path,
@@ -1275,7 +1449,7 @@ def run_with_fake_proc(command: str, base: Path, proc: Path, bin_dir: Path,
 
 
 def fake_desktop_scenario(base: Path) -> tuple[Path, dict]:
-    """Chroot falso, sessao publicada e cinco processos (um de fora).
+    """Chroot falso, sessao publicada e quatro processos (um de fora).
 
     Devolve o /proc falso e o mapa de processos (pid -> root, cmdline, rss,
     pss), que o teste da medicao usa para montar os contadores de leitura.
@@ -1284,8 +1458,7 @@ def fake_desktop_scenario(base: Path) -> tuple[Path, dict]:
     (chroot / "tmp").mkdir(parents=True, exist_ok=True)
     (chroot / "usr" / "bin").mkdir(parents=True, exist_ok=True)
     (chroot / "usr" / "local" / "bin").mkdir(parents=True, exist_ok=True)
-    for nome in ("Xvnc", "socat", "openbox", "tint2", "pcmanfm",
-                 "malta-session"):
+    for nome in ("Xvnc", "openbox", "tint2", "pcmanfm"):
         (chroot / "usr" / "bin" / nome).write_bytes(b"#!/bin/sh\nexit 0\n")
     (chroot / "usr" / "local" / "bin" / "malta-session").write_bytes(
         b"#!/bin/sh\nexit 0\n")
@@ -1297,8 +1470,6 @@ def fake_desktop_scenario(base: Path) -> tuple[Path, dict]:
     raiz = chroot.as_posix()
     processos = {
         101: (raiz, "/usr/bin/Xvnc :1 -geometry 1024x600", 8000, 5000),
-        102: (raiz, "/usr/bin/socat TCP-LISTEN:5901,fork TCP:127.0.0.1:5901",
-              1500, 900),
         103: (raiz, "/bin/sh /usr/local/bin/malta-session", 1100, 460),
         104: (raiz, "/usr/bin/pcmanfm --desktop", 66000, 41000),
         200: ("/", "/usr/bin/algo-do-host", 500, 100),
@@ -1363,11 +1534,11 @@ class DeviceProcessScanTests(unittest.TestCase):
 
     Regressao: a lista de padroes era uma alternancia do case vinda de uma
     variavel, o que nunca casa. O stop encerrava so a sessao e deixava o Xvnc
-    e o socat vivos no aparelho; o measure somava sem os componentes da sessao.
+    vivo no aparelho; o measure somava sem os componentes da sessao.
     """
 
     def _cenario(self, base: Path) -> Path:
-        """Chroot falso, sessao publicada e cinco processos (um de fora)."""
+        """Chroot falso, sessao publicada e quatro processos (um de fora)."""
         proc, _processos = fake_desktop_scenario(base)
         return proc
 
@@ -1381,10 +1552,10 @@ class DeviceProcessScanTests(unittest.TestCase):
         self.assertEqual(resultado.returncode, 0, resultado.stderr)
         data = core.parse_measure(resultado.stdout)
         nomes = [processo["name"] for processo in data["processes"]]
-        self.assertEqual(nomes, ["Xvnc", "socat", "openbox", "tint2", "pcmanfm"])
+        self.assertEqual(nomes, ["Xvnc", "openbox", "tint2", "pcmanfm"])
         # O total tem que incluir os componentes da sessao (pcmanfm).
-        self.assertEqual(data["total_pss_kb"], 5000 + 900 + 460 + 41000)
-        self.assertEqual(data["total_rss_kb"], 8000 + 1500 + 1100 + 66000)
+        self.assertEqual(data["total_pss_kb"], 5000 + 460 + 41000)
+        self.assertEqual(data["total_rss_kb"], 8000 + 1100 + 66000)
         # O processo 200 esta fora do chroot: ele nao pode entrar em nenhuma
         # linha nem nos totais.
         self.assertFalse([linha for linha in resultado.stdout.splitlines()
@@ -1403,7 +1574,7 @@ class DeviceProcessScanTests(unittest.TestCase):
         self.assertEqual(resultado.returncode, 0, resultado.stderr)
         self.assertIn("Malta Desktop parado", resultado.stdout)
         # Todos os componentes entram na lista de encerramento: antes o stop
-        # encerrava so a sessao e deixava o Xvnc e o socat orfaos.
+        # encerrava so a sessao e deixava o Xvnc vivo (e o proxy).
         pids = []
         coletando = False
         for linha in resultado.stdout.splitlines():
@@ -1417,11 +1588,29 @@ class DeviceProcessScanTests(unittest.TestCase):
                 else:
                     coletando = False
         self.assertTrue(pids, "o stop nao listou o que ia encerrar")
-        for pid in ("101", "102", "103", "104"):
+        for pid in ("101", "103", "104"):
             self.assertIn(pid, pids,
                           f"o pid {pid} ficou de fora da lista de encerramento")
         self.assertNotIn("200", pids,
                          "o stop tentou encerrar processo de fora do chroot")
+
+    def test_stop_reports_the_xvnc_that_survived(self):
+        """O stop e a garantia de que o Xvnc nao fica orfao.
+
+        O "kill" de mentira nao mata ninguem: o Xvnc continua vivo e o stop
+        tem de dizer isso (o proximo start bateria na porta 5901 ocupada).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            proc = self._cenario(base)
+            bin_dir = base / "bin"
+            stub_readlink(bin_dir)
+            stub_kill(bin_dir, mata=False)
+            stub_id(bin_dir)
+            resultado = run_with_fake_proc("stop", base, proc, bin_dir)
+        self.assertNotEqual(resultado.returncode, 0,
+                            "o stop aceitou um Xvnc vivo")
+        self.assertIn("o Xvnc sobreviveu ao stop", resultado.stdout)
 
 
 class DeviceMeasureCacheTests(unittest.TestCase):
@@ -1433,9 +1622,9 @@ class DeviceMeasureCacheTests(unittest.TestCase):
     linha PROC= estourava o prazo e a medicao saia pela metade.
     """
 
-    # Processos do desktop no cenario falso: Xvnc, socat, sessao e pcmanfm
-    # (o quinto esta fora do chroot).
-    PROCESSOS_DO_DESKTOP = 4
+    # Processos do desktop no cenario falso: Xvnc, sessao e pcmanfm
+    # (o quarto esta fora do chroot).
+    PROCESSOS_DO_DESKTOP = 3
     # O smaps falso tem uma linha por processo: cada abertura consome a
     # linha e mais uma leitura de EOF. O trace conta as leituras, entao o
     # numero de leituras e o dobro do numero de aberturas.
@@ -1461,10 +1650,10 @@ class DeviceMeasureCacheTests(unittest.TestCase):
         )
         # E os valores continuam certos.
         data = core.parse_measure(resultado.stdout)
-        self.assertEqual(data["total_pss_kb"], 5000 + 900 + 460 + 41000)
-        self.assertEqual(data["total_rss_kb"], 8000 + 1500 + 1100 + 66000)
+        self.assertEqual(data["total_pss_kb"], 5000 + 460 + 41000)
+        self.assertEqual(data["total_rss_kb"], 8000 + 1100 + 66000)
         nomes = [processo["name"] for processo in data["processes"]]
-        self.assertEqual(nomes, ["Xvnc", "socat", "openbox", "tint2", "pcmanfm"])
+        self.assertEqual(nomes, ["Xvnc", "openbox", "tint2", "pcmanfm"])
         for processo in data["processes"]:
             self.assertGreater(processo["rss_kb"], 0, processo)
             self.assertGreater(processo["pss_kb"], 0, processo)

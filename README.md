@@ -29,8 +29,8 @@ próprio link USB RNDIS, e o teclado e o mouse do PC viajam como eventos X11 par
 Alpine.
 
 Quem roda o ambiente gráfico é o **celular**, não o PC. No aparelho, um `Xvnc` do TigerVNC
-sustenta a sessão X e um `socat` publica a porta VNC **apenas na interface USB**
-(`10.55.0.2:5901`).
+sustenta a sessão X e **escuta direto na interface USB** (`10.55.0.2:5901`): não há proxy
+`socat` no meio.
 
 ### Como o fluxo funciona
 
@@ -53,10 +53,8 @@ sustenta a sessão X e um `socat` publica a porta VNC **apenas na interface USB*
 │                                                            │
 │                             │                              │
 │                             ▼                              │
-│                    Xvnc :1 1024x600x16  (-localhost)       │
-│                             │                              │
-│                             ▼                              │
-│                    socat :5901 (bind 10.55.0.2)            │
+│                    Xvnc :1 1024x600x16                      │
+│                    (-interface 10.55.0.2:5901)              │
 │                             │                              │
 │                             ▼                              │
 │          openbox · tint2 · pcmanfm · xterm · jgmenu        │
@@ -81,6 +79,11 @@ a encerra ao sair — mas só encerra a central que ele mesmo subiu. O painel we
 existindo como **diagnóstico secundário**, separado da janela do desktop (botão
 **Abrir painel web**).
 
+> **A central Flask é a dona da porta serial**, e a serial é um recurso único. **Não abra o
+> painel web e o Malta Desktop ao mesmo tempo**: duas centrais disputam a mesma porta
+> COM. O Malta Desktop **reaproveita** a central que estiver rodando e só inicia uma cópia
+> oculta quando não há nenhuma.
+
 ### O que roda no celular
 
 O rootfs do aparelho é um **initramfs em RAM** e a única persistência é `/data` (f2fs em
@@ -99,7 +102,6 @@ vive num **chroot Alpine persistente em `/data/malta-desktop/root`**, criado com
 | `xterm` | 410 | terminal |
 | `font-dejavu` | 2.37 | fonte do painel, do menu e do terminal |
 | `hicolor-icon-theme` | branch v3.24 | tema de ícones |
-| `socat` | branch v3.24 | publica o VNC só em `10.55.0.2:5901` |
 | `xset`, `xsetroot`, `setxkbmap` | branch v3.24 | teste do X, papel de parede e layout de teclado (`br`) |
 | `xkeyboard-config`, `xkbcomp` | branch v3.24 | mapas de teclado do X |
 | `busybox`, `alpine-baselayout` | branch v3.24 | base do chroot |
@@ -108,20 +110,30 @@ Os componentes com versão fixada na tabela foram conferidos um a um no APKINDEX
 reais de **armv7** (Alpine v3.24, `main` e `community`). Os demais seguem a branch do
 aparelho (derivada de `/etc/alpine-release`) e não têm versão fixada no repositório.
 
+O `socat` **saiu da lista**: o `Xvnc` escuta direto na interface USB e não há proxy no meio.
+Com isso, o pacote sumiu do instalador, do `doctor` e do `measure` — a chave `SOCAT_PID`
+continua no contrato do `status` (valendo sempre `0`) só para não quebrar a leitura do PC.
+
 `lxpanel` **não existe** para armv7 — daí a escolha de `tint2` (painel) + `jgmenu` (menu)
 em vez de uma suíte LXDE. Não há XFCE, GNOME, KDE, Electron ou Chromium em lugar nenhum.
 
 **A sessão X**, com o que roda dentro do chroot:
 
 ```
-Xvnc :1 -geometry 1024x600 -depth 16 -rfbport 5901 -rfbauth /root/.vnc/passwd -SecurityTypes VncAuth -localhost
-socat TCP-LISTEN:5901,bind=10.55.0.2,reuseaddr,fork TCP:127.0.0.1:5901
+Xvnc :1 -geometry 1024x600 -depth 16 -rfbport 5901 -rfbauth /root/.vnc/passwd -SecurityTypes VncAuth -interface 10.55.0.2
 ```
 
-O `Xvnc` escuta **somente em loopback**; o `socat` é o único processo amarrado à interface
-USB, e o VNC **nunca** aparece em `0.0.0.0` nem na interface Wi-Fi. A senha VncAuth é um
-arquivo de **8 bytes** no formato d3des do TigerVNC, gerado pelo próprio PC e reenviado ao
-aparelho a cada instalação.
+O `Xvnc` escuta **direto na interface USB** (`10.55.0.2:5901`): o VNC **nunca** aparece em
+`0.0.0.0` nem na interface Wi-Fi, e **não há `socat`/proxy** no meio.
+
+> **Por que `-interface` e não `-localhost`.** No TigerVNC 1.16, `-localhost` usa
+> `createLocalTcpListeners()`, que **não devolve endereço/porta** neste aparelho: o `Xvnc`
+> aborta com `vncExtInit: No path or port configured for incoming connections`. Com
+> `-interface 10.55.0.2` (que usa `createTcpListeners()`) o mesmo `Xvnc` sobe normalmente.
+> É uma limitação medida no Moto E7 Power, não uma preferência de estilo.
+
+A senha VncAuth é um arquivo de **8 bytes** no formato d3des do TigerVNC, gerado pelo próprio
+PC e reenviado ao aparelho a cada instalação.
 
 A sessão (`device/session.sh`) sobe `openbox` + `tint2` (painel aubergine `#2c001e`,
 relógio, tarefas e 3 launchers com ícones XPM próprios) + `pcmanfm --desktop` (papel de
@@ -143,6 +155,35 @@ descartado porque o download direto do SourceForge retornou HTTP 403 nesta rede,
 formato do arquivo de senha do visualizador oficial varia por versão. Um cliente próprio
 elimina a dependência, o processo extra e o problema do formato da senha.
 
+### Instalação real no aparelho (medida)
+
+O `install.sh` foi executado **no Moto E7 Power de verdade** (root, sem container). Números
+medidos nessa execução:
+
+| Dado | Valor medido |
+|------|--------------|
+| Branch do chroot | Alpine **v3.24**, `armv7` |
+| Pacotes instalados | **163** (15 explícitos + dependências) |
+| Tamanho do chroot | **309,2 MiB** em `/data/malta-desktop/root` |
+| Tempo de instalação | **~90 s** |
+| Persistência | `/data` — o rootfs do aparelho é initramfs em RAM |
+| Versão do bundle | **md5 do `install.sh`** (fonte única, PC e aparelho) |
+
+A lista explícita de pacotes é a variável `PACKAGES` do `device/install.sh`:
+
+```sh
+alpine-baselayout busybox openbox tint2 jgmenu pcmanfm xterm font-dejavu \
+hicolor-icon-theme tigervnc xset xsetroot setxkbmap xkeyboard-config xkbcomp
+```
+
+O `socat` **não está** na lista: o VNC não passa por proxy.
+
+O instalador é idempotente (rodar de novo reusa o chroot) e grava em
+`/data/malta-desktop/version` o **md5 do `install.sh` instalado**. É esse o contrato de
+versão entre o PC e o aparelho: o PC calcula o md5 do `device/install.sh` local e compara —
+divergência significa "reinstalar", e os dois lados leem o mesmo arquivo, então não há
+constante que possa divergir.
+
 ### Por que esta arquitetura minimiza RAM e CPU
 
 - **Chroot em `/data`, não no rootfs.** O rootfs do aparelho é RAM: instalar o ambiente
@@ -151,8 +192,8 @@ elimina a dependência, o processo extra e o problema do formato da senha.
   execução pesam na RAM** — depois de instalado, nada mais é baixado.
 - **Componentes mínimos em vez de uma DE.** XFCE/GNOME/KDE trariam dezenas de processos
   (painel, gerenciador de arquivos, `dbus`, agente de notificações, daemon de rede…). Aqui a
-  sessão inteira é **seis processos**: `Xvnc`, `socat`, a sessão (`sh`), `openbox`, `tint2` e
-  `pcmanfm` — mais o `xterm`, só quando aberto.
+  sessão inteira é **cinco processos**: `Xvnc`, a sessão (`sh`), `openbox`, `tint2` e
+  `pcmanfm` — mais o `xterm`, só quando aberto. Não há proxy: o `socat` saiu da arquitetura.
 - **Sem Electron/WebView/Chromium.** Um Electron no aparelho carregaria o runtime do
   Chromium inteiro; um Chromium headless, idem. Nenhum dos dois está aqui: o PC desenha.
 - **Sem VNC no navegador (noVNC).** O noVNC é JS + canvas rodando no navegador do PC:
@@ -167,8 +208,8 @@ elimina a dependência, o processo extra e o problema do formato da senha.
   bpp: menos RAM no `Xvnc`, menos bytes por atualização e decodificação mais barata no PC.
   Uma atualização de tela cheia são ~1,2 MB; o modo incremental e o `CopyRect` mantêm o
   tráfego real bem abaixo disso.
-- **`-localhost` + `socat` com `bind`.** O Xvnc nunca escuta na rede e o único caminho para
-  o VNC é o proxy amarrado à interface USB: nada é exposto por engano na interface Wi-Fi.
+- **`-interface 10.55.0.2` no Xvnc.** O VNC fica preso à interface USB: nada é exposto por
+  engano na interface Wi-Fi, e não há processo extra (o proxy) no meio do caminho.
 
 ### Requisitos e instalação no Windows
 
@@ -218,15 +259,16 @@ elimina a dependência, o processo extra e o problema do formato da senha.
    em segundo plano no aparelho. Acompanhe o progresso no log da janela: as etapas são
    `preflight → mounts → apk → config → session → vnc → verify → done`, lidas de
    `run/install.status`. **Esta é a única etapa que precisa de internet**: o `apk` baixa os
-   pacotes do espelho Alpine pelo RNDIS e pode levar vários minutos. A própria tela avisa se
-   o `apk` falhar por falta de rota/DNS.
+   pacotes do espelho Alpine pelo RNDIS. **No aparelho real a instalação levou ~90 s**
+   (163 pacotes, 309,2 MiB); a própria tela avisa se o `apk` falhar por falta de rota/DNS.
 
    O **limite de upload não é um número fixo**: o app lê o limite efetivo da central em
    `GET /api/settings` (`transfer_upload_kb` — 32 KB por padrão, **64 KB de teto rígido**) e
    obedece ao que está em vigor. Se o bundle não couber no limite em vigor, o app **eleva o
    limite da central para 64 KB** e registra isso explicitamente no log
    (`limite de upload da central elevado para 64 KB para acomodar o bundle do desktop`);
-   só falha quando nem o teto cabe.
+   só falha quando nem o teto cabe. Na prática a elevação é necessária: o `device/malta-desktop.sh`
+   tem ~32,8 KB e não passa no padrão de 32 KB.
 
    O aparelho grava em `/data/malta-desktop/version` o **md5 do `install.sh` que recebeu**, e o
    PC compara com o md5 do `device/install.sh` local. Os dois lados leem o mesmo arquivo: não
@@ -234,9 +276,14 @@ elimina a dependência, o processo extra e o problema do formato da senha.
    cada sondagem.
 5. **Conectar desktop.** O app **não abre uma conexão TCP crua** no `10.55.0.2:5901` para
    checar se o desktop está de pé. A prontidão vem do **estado que o próprio aparelho
-   publica**: `STATE=running`, `X_READY=1` e `SOCAT_PID` diferente de zero. A presença do
-   cabo não é confundida com desktop disponível, e nenhuma conexão descartável chega ao
-   `Xvnc`. A janela **Alpine Linux — malta** abre com o framebuffer 1024×600.
+   publica**: `STATE=running` **e** `X_READY=1`. A presença do cabo não é confundida com
+   desktop disponível, e nenhuma conexão descartável chega ao `Xvnc`. A janela
+   **Alpine Linux — malta** abre com o framebuffer 1024×600.
+
+   O `SOCAT_PID` **deixou de ser gate**: com o proxy fora do caminho ele vale sempre `0`, e um
+   gate nele diria "desktop parado" mesmo com a sessão no ar. Aparelhos com o **script
+   antigo** (que não publicam `X_READY` no `status`) continuam usando o critério antigo
+   (`STATE=running` + `SOCAT_PID` ≠ `0`) e a sonda TCP de reserva.
 
 Depois de instalada, a sessão funciona **sem internet**: o X, o painel e os programas são
 locais e o VNC trafega só pela interface USB. A internet pelo cabo é necessária apenas
@@ -255,7 +302,7 @@ São **duas janelas**:
 | **Conectar desktop** | abre a sessão VNC; instala (quando o md5 do `device/install.sh` local difere do que o aparelho gravou em `/data/malta-desktop/version`) e inicia o desktop no aparelho quando ele ainda não está no ar |
 | **Desconectar** | fecha a sessão VNC; o desktop **continua rodando** no aparelho |
 | **Instalar/Reparar desktop** | reenvia o bundle, roda o `install.sh` e sobe o desktop |
-| **Parar desktop** | encerra `Xvnc`, `socat` e a sessão no aparelho (e desliga a conexão automática) |
+| **Parar desktop** | encerra o `Xvnc` e a sessão no aparelho (e desliga a conexão automática); o `stop` **confirma que o Xvnc morreu** |
 | **Medir memória** | mede PSS/RSS por processo (ver abaixo) |
 | **Diagnóstico** | roda o `doctor` no aparelho e devolve linhas PASS/FAIL (ver abaixo) |
 | **Abrir painel web** | abre o painel em `http://127.0.0.1:8666/` no navegador |
@@ -263,11 +310,11 @@ São **duas janelas**:
 | *Iniciar o monitor com o Windows* | instala/remove o `.cmd` da pasta Startup |
 
 O monitor **não abre conexão TCP** para decidir se o desktop está de pé: ele pergunta ao
-aparelho (`STATE`, `X_READY`, `SOCAT_PID`). A sonda TCP crua ficou só como **reserva rara**
-(no máximo **1× a cada 30 s**) e só para aparelhos cujo `status` ainda não traz `X_READY`
-(script antigo). Isso não é detalhe: cada conexão que morre antes do handshake chega ao
-`Xvnc` pelo `socat` e conta como **falha de login** para o TigerVNC, que bloqueia o endereço
-de origem por 1200 s e derruba a sessão legítima logo depois.
+aparelho (`STATE` e `X_READY`). A sonda TCP crua ficou só como **reserva rara** (no máximo
+**1× a cada 30 s**) e só para aparelhos cujo `status` ainda não traz `X_READY` (script
+antigo). Isso não é detalhe: cada conexão que morre antes do handshake chega direto ao
+`Xvnc` e conta como **falha de login** para o TigerVNC, que bloqueia o endereço de origem
+por 1200 s e derruba a sessão legítima logo depois.
 
 **Teclado e mouse.** O `Canvas` do Tk captura `<KeyPress>`, `<KeyRelease>`, `<Motion>` e os
 botões 1/2/3, e converte tudo em mensagens RFB: `KeyEvent` com keysym X11 e `PointerEvent`
@@ -285,16 +332,14 @@ gerada uma vez e reutilizada; é o arquivo a apagar na remoção. No Windows, o 
 ### Medir e diagnosticar
 
 **Medir memória** (`malta-desktop.sh measure`) devolve uma linha de total e uma linha por
-processo:
+processo. No **Moto E7 Power real** (ARMv7, 1,78 GB de RAM):
 
 ```
-RSS total 164,0 MB · PSS total 99,5 MB · memória <livre> de <total> · disponível <%>
-  Xvnc: RSS 54,8 MB · PSS 35,9 MB
-  pcmanfm: RSS 64,4 MB · PSS 40,1 MB
-  openbox: RSS 16,0 MB · PSS 7,9 MB
-  tint2: RSS 14,5 MB · PSS 6,4 MB
-  xterm: RSS 10,9 MB · PSS 6,8 MB
-  socat: RSS 2,5 MB · PSS 2,0 MB
+RSS total 114,6 MiB · PSS total 73,5 MiB · memória <livre> de <total> · disponível <%>
+  Xvnc: RSS 44,2 MiB · PSS 30,5 MiB
+  pcmanfm: RSS 49,0 MiB · PSS 32,0 MiB
+  openbox: RSS 10,9 MiB · PSS 5,9 MiB
+  tint2: RSS 9,6 MiB · PSS 4,6 MiB
 ```
 
 O script separa **PSS de RSS**, separa a memória do ambiente gráfico da memória basal do
@@ -323,17 +368,19 @@ PASS espaco
 PASS rndis
 PASS xvnc
 PASS x
-PASS socat
 PASS vnc
 PASS sessao
 PASS versao
-OK=15
+OK=14
 FALHAS=0
 RESULT=PASS
 ```
 
 As verificações são: `root`, `data`, `base`, `binarios`, `configs`, `vncpasswd`, `mounts`,
-`espaco`, `rndis`, `xvnc`, `x`, `socat`, `vnc`, `sessao` e `versao`.
+`espaco`, `rndis`, `xvnc`, `x`, `vnc`, `sessao` e `versao` — **14 no total**. O `doctor`
+rodado **no aparelho real** devolveu **14 PASS / 0 FAIL**. A verificação `vnc` confere a
+porta 5901 escutando **em `10.55.0.2`** (o Xvnc escuta direto na interface USB: não há
+proxy no meio).
 
 **Logs no aparelho.** Pelo **Terminal** do painel de diagnóstico (a ferramenta secundária) ou
 por qualquer shell root:
@@ -348,27 +395,30 @@ cat /data/malta-desktop/root/tmp/session.log         # log da sessão X
 
 ### Memória medida — e o que ela não prova
 
-Medido em **container Alpine 3.24 x86_64** (Docker + WSL2) com o `measure` real do projeto:
+Medido **no Moto E7 Power real** (Alpine 3.24 **armv7**, 1,78 GB de RAM) com o `measure`
+real do projeto, com o desktop em repouso:
 
 | Processo | PSS | RSS |
 |----------|-----|-----|
-| `Xvnc` | 35,9 MB | 54,8 MB |
-| `pcmanfm` | 40,1 MB | 64,4 MB |
-| `openbox` | 7,9 MB | 16,0 MB |
-| `tint2` | 6,4 MB | 14,5 MB |
-| `xterm` | 6,8 MB | 10,9 MB |
-| `socat` | 2,0 MB | 2,5 MB |
-| sessão (`sh`) | 0,45 MB | — |
-| **total** | **≈ 99,5 MB PSS** | **≈ 164 MB RSS** |
+| `Xvnc` | 30,5 MiB (31.188 KB) | 44,2 MiB (45.208 KB) |
+| `pcmanfm` | 32,0 MiB (32.746 KB) | 49,0 MiB (50.208 KB) |
+| `openbox` | 5,9 MiB (6.072 KB) | 10,9 MiB (11.120 KB) |
+| `tint2` | 4,6 MiB (4.684 KB) | 9,6 MiB (9.844 KB) |
+| **total** | **73,5 MiB (75.226 KB) PSS** | **114,6 MiB (117.408 KB) RSS** |
 
-O alvo do projeto é **≤ ~150 MiB de RAM residente em repouso**: o PSS fica bem abaixo; o RSS
-soma (≈ 156 MiB) fica um pouco acima, em parte pela memória compartilhada contada em dobro.
-Com o **menu jgmenu aberto** somam-se **+8,1 MB PSS** (17,2 MB RSS) enquanto o menu está na
-tela.
+`MemAvailable` do sistema no momento da medição: **1.688.516 KB**. Com ~1,78 GB de RAM no
+aparelho, o ambiente gráfico consome **~130 MB** — cerca de **7 %** da memória total.
 
-> **A medição no ARMv7 do celular não foi feita** (não havia aparelho). Em ARMv7 o consumo
-> tende a ser **menor**, mas isso **não** foi medido — trate os números acima como uma
-> referência de container, não como um número do Moto E7 Power.
+A meta do projeto é **≤ ~150 MiB de RAM residente em repouso**: ela é **atingida**. O PSS
+(73,5 MiB) fica bem abaixo e o RSS somado (114,6 MiB) também. PSS (soma de `Pss:` do
+`smaps`) é a métrica honesta: com memória compartilhada, a soma das RSS de cada processo
+conta os mesmos bytes várias vezes.
+
+**Comparação honesta com o container.** A medição anterior, feita em **container Alpine
+3.24 x86_64** (Docker + WSL2), dava **PSS ~99,5 MB** para o mesmo stack. No ARMv7 do celular
+o mesmo stack sai **~24 MB mais leve** (73,5 MiB de PSS, sem proxy e com o `xterm` fechado).
+Os dois números são reais, mas **o do ARMv7 é o válido**: o do container serve só como
+referência de ordem de grandeza. O ARMv7 não é "provavelmente menor" — foi medido.
 
 ### Limitações conhecidas
 
@@ -399,9 +449,10 @@ Vale registrar porque explicam por que existe o gate de validação:
 - O **DES do VncAuth estava errado**: o VNC usa d3des com os bits da chave invertidos, e o
   TigerVNC recusava **toda** a conexão e ainda blacklista o IP. Corrigido espelhando cada
   byte da chave; os vetores passaram a bater com o binário real do `vncpasswd`.
-- O `stop` **deixava `Xvnc` e `socat` vivos** (um `case` com alternância vinda de variável,
-  que o shell não interpreta como alternância). O desktop continuava acessível depois de
-  "Parar desktop" e o `measure` subcontava. Corrigido comparando padrão a padrão.
+- O `stop` **deixava `Xvnc` (e o proxy do bundle antigo) vivos** (um `case` com alternância
+  vinda de variável, que o shell não interpreta como alternância). O desktop continuava
+  acessível depois de "Parar desktop" e o `measure` subcontava. Corrigido comparando padrão a
+  padrão; hoje o `stop` ainda **confirma que o `Xvnc` morreu**.
 - **`/dev/pts` e `/dev/shm` não montados no chroot** matavam o `xterm` ("not enough ptys").
 - O **menu jgmenu nascia ilegível**: o CSV de aplicativos não existia, o `XDG_CONFIG_DIRS`
   não tinha `/etc/xdg` e a opção de cor `color_menu_fg` não existe no jgmenu 4.5 (é
@@ -410,12 +461,12 @@ Vale registrar porque explicam por que existe o gate de validação:
 - O **redirecionamento de log do instalador quebrava em aparelho limpo**, porque o
   diretório era criado depois do redirecionamento.
 - O app **sondava a porta 5901 com uma conexão TCP crua** a cada 3 s para decidir se o
-  desktop estava de pé. Cada conexão que morre antes do handshake chega ao `Xvnc` pelo
-  `socat` e conta como **falha de login** do `127.0.0.1`: o TigerVNC **blacklista o
-  endereço de origem** e, expirado o bloqueio (1200 s ≈ 20 min), recusa também o cliente
-  legítimo que chega pelo mesmo `socat`. A prontidão passou a vir do **estado publicado
-  pelo aparelho** (`STATE=running`, `X_READY=1`, `SOCAT_PID` ≠ 0), e a conexão crua ficou só
-  como reserva rara (1× a cada 30 s) para aparelho com script antigo.
+  desktop estava de pé. Cada conexão que morre antes do handshake chega ao `Xvnc` e conta como
+  **falha de login** do endereço de origem: o TigerVNC **blacklista o endereço de origem** e,
+  expirado o bloqueio (1200 s ≈ 20 min), recusa também o cliente legítimo que chega pelo
+  mesmo caminho. A prontidão passou a vir do **estado publicado pelo aparelho**
+  (`STATE=running` + `X_READY=1`), e a conexão crua ficou só como reserva rara (1× a cada
+  30 s) para aparelho com script antigo.
 - A **versão do bundle** era uma constante ("1") escrita dos dois lados: qualquer divergência
   fazia o app **reinstalar o bundle a cada sondagem**. Agora o aparelho grava o **md5 do
   `install.sh` que recebeu** e o PC compara com o md5 do `device/install.sh` local — os dois
@@ -434,6 +485,25 @@ Vale registrar porque explicam por que existe o gate de validação:
 - **Fechar a janela do desktop** deixava a **central oculta órfã** no Windows (o `Popen`
   sobrevive ao pai). O encerramento da janela agora segue a mesma ordem do fechar da janela
   de controle: monitor parado, central que o app subiu encerrada, janela destruída.
+- **O `x_ready` travava a serial por ~2 minutos.** O `xset` sem prazo bloqueava indefinidamente
+  quando sobrava um socket X obsoleto (servidor morto) no chroot, e a console ficava ocupada
+  esse tempo todo. Aconteceu de verdade no aparelho. Agora o `xset` roda com `timeout 5`: a
+  espera é cortada e a saída diferente de zero significa "o X não responde".
+- **O PID do `Xvnc` era o do pai, não o do servidor.** O `setsid` faz *fork* quando o processo
+  é líder de grupo (o shell do console é interativo), e o `$!` do spawn é o PID do pai — que
+  sai na hora. O script declarava o `Xvnc` morto e subia outro, que falhava com "porta 5901 já
+  em uso". Agora o PID é descoberto pelo `/proc`, varrendo o cmdline.
+- **A porta 5901 ocupada falhava de forma obscura.** O `start` agora **falha com mensagem
+  clara** ("a porta 5901 já está em uso; o desktop anterior pode não ter sido encerrado
+  (rode stop)") em vez de deixar o `Xvnc` reclamar "address already in use".
+- **O `stop` podia deixar o `Xvnc` órfão.** Ele é o processo que segura a porta 5901, e um
+  `Xvnc` vivo fazia o próximo `start` falhar. O `stop` agora **confirma que o `Xvnc` morreu**
+  (e que nenhum processo resistiu ao `KILL`) e devolve erro se sobrou algo vivo.
+- **O Windows 11 não amarra o driver RNDIS se o ACM vier primeiro.** O "Remote NDIS based
+  Internet Sharing Device" só é amarrado quando a função RNDIS é a **primeira** interface do
+  gadget (`MI_00`). Com o ACM antes, o RNDIS nasce em `MI_02` e o driver falha com **Code 10**
+  (`CM_PROB_FAILED_START`): nenhum adaptador de rede é criado e o PC não alcança o aparelho.
+  Detalhe em [Solução de problemas do desktop](#solução-de-problemas-do-desktop).
 
 ### Solução de problemas do desktop
 
@@ -448,6 +518,38 @@ significa que a serial não subiu.
 `setup_windows_network.bat` com a central em execução. O `setup_windows_network.ps1` dá
 `10.55.0.1/24` ao PC na interface RNDIS e cria o NAT; se o Windows já usar WinNAT (WSL,
 Docker, Hyper-V), ele avisa do conflito em vez de apagar a configuração existente.
+
+**RNDIS com "Code 10" no Windows (requisito do host Windows)** — este é o problema mais
+traiçoeiro do projeto no PC. O Windows 11 **só amarra o driver "Remote NDIS based Internet
+Sharing Device" quando a função RNDIS é a PRIMEIRA interface do gadget (`MI_00`)**. Se o
+**ACM vier antes**, o RNDIS nasce em `MI_02` e o driver falha ao iniciar com **Code 10**
+(`CM_PROB_FAILED_START`): **nenhum adaptador de rede é criado** e o PC não alcança o
+aparelho. O sintoma no Gerenciador de Dispositivos é o device "Remote NDIS based Internet
+Sharing Device" com **Code 10**, e o `setup_windows_network.bat` nunca acha o adaptador.
+
+O que fazer:
+
+- **Confirme a ordem pelo lado do PC** (o `app.py` faz isso sozinho, via `Get-PnpDevice`):
+  o `InstanceId` do device RNDIS carrega a interface do gadget — `USB\VID_…&MI_00\…` é a
+  **ordem certa**; `&MI_02\…` é a **ordem errada** (ACM primeiro):
+
+  ```powershell
+  Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -like '*NDIS*' } |
+      Select-Object FriendlyName, InstanceId, Status
+  ```
+
+- **A correção é no aparelho**: o `app.py` desliga o UDC, deslinka as duas funções e
+  religa na ordem `rndis → acm` (o `acm.gs0` do console **nunca** é removido — só o link é
+  refeito, e é ele que devolve a serial). O `app.py` confere a ordem **no PC** e só toca no
+  gadget quando ela está **errada**; se a consulta ao PnP falhar, o resultado é "unknown" e
+  **nada** é tocado.
+- **No Linux a ordem é indiferente**: o kernel nomeia as interfaces pelo driver, não pela
+  ordem do link, e o `app.py` nunca toca no gadget fora do Windows.
+
+> A ordem dos links nasce do `init` do aparelho, que cria o **ACM antes** do RNDIS — por isso
+> a ordem errada **volta a cada reinício do celular**. O app corrige em runtime; o ciclo
+> completo de boot ainda não foi validado (ver
+> [O que ainda não foi provado](#o-que-ainda-não-foi-provado)).
 
 **`/data` não montado** — o instalador recusa começar. Monte pelo painel web
 (ação **Montar /data**) ou, no terminal:
@@ -475,9 +577,9 @@ novo limite de upload`. Ajuste o limite pela UI do painel web (**Configurações
 **Upload**, teto de 64 KB) e repita **Instalar/Reparar desktop**.
 
 **`10.55.0.2:5901` não responde** — o VNC não está no ar. Use **Diagnóstico**: `PASS xvnc`,
-`PASS x` e `PASS socat` dizem em qual degrau parou. `FAIL rndis` significa que o
+`PASS x` e `PASS vnc` dizem em qual degrau parou. `FAIL rndis` significa que o
 `rndis0` do aparelho está sem `10.55.0.2`. O app **não** testa a porta para saber disso: ele
-lê o `status` do aparelho (`STATE`, `X_READY`, `SOCAT_PID`). Do lado do PC, o teste manual é:
+lê o `status` do aparelho (`STATE` e `X_READY`). Do lado do PC, o teste manual é:
 
 ```powershell
 Test-NetConnection 10.55.0.2 -Port 5901
@@ -531,7 +633,7 @@ o `start` refaz as montagens.
 
 ## Estado validado
 
-Testado ao vivo em 19–20/10/2026:
+Testado ao vivo em 19–21/10/2026:
 
 - Celular com Alpine, console ACM e RNDIS no mesmo gadget USB.
 - MACs fixos: `dev_addr 02:00:00:00:00:02` / `host_addr 02:00:00:00:00:01`.
@@ -542,7 +644,7 @@ Testado ao vivo em 19–20/10/2026:
 - **Reboot do celular testado**: após reiniciar, o app recriou o RNDIS com os MACs fixos,
   reconfigurou IP/rota/DNS, montou `/data` e voltou a `prov=ok` sem intervenção.
 - `sysrq b` é o reset que funciona; o `reboot` do BusyBox é ignorado pelo init do aparelho.
-- **269 testes automatizados** passando em Linux e Windows (`unittest`, exit 0), com 1 skip
+- **311 testes automatizados** passando em Linux e Windows (`unittest`, exit 0), com 1 skip
   pré-existente e alheio ao desktop. Contagem de 21/10/2026. Cobrem política de arquivos,
   confirmação de ações, catálogo, IA **e** o desktop: o DES d3des do VncAuth conferido contra
   o binário real do `vncpasswd` do TigerVNC, um servidor RFB falso, o contrato entre as
@@ -560,35 +662,69 @@ x86_64 — não é o ARMv7 do celular)**, com os scripts e pacotes reais:
   `#300a24` quantizada em RGB565, sem troca de canais).
 - **Entrada comprovada por diff de pixels**: ponteiro (122 px alterados) e teclado (359 px
   alterados, com "malta" digitado no terminal).
-- **Exposição de rede conferida**: `Xvnc` só em `127.0.0.1`, `socat` só em `10.55.0.2`.
 - `stop` sem processos órfãos, `start` idempotente, autostart criado e removido e o limite
   de 500 caracteres do `/api/cmd` respeitado.
 
+> Essa execução é do **conjunto anterior** (com o proxy `socat` no meio). O que mudou depois —
+> o `Xvnc` com `-interface` e a ordem do RNDIS no Windows — foi validado no aparelho real,
+> logo abaixo.
+
+### Malta Desktop validado no aparelho real (Moto E7 Power)
+
+O mesmo caminho foi validado **no hardware de verdade** — Moto E7 Power (Alpine 3.24
+**armv7**) com o Windows 11 como host:
+
+- **Instalação real**: `install.sh` executado no aparelho — **163 pacotes, 309,2 MiB** no
+  chroot `/data/malta-desktop/root`, **~90 s**; versão do bundle = **md5 do `install.sh`**.
+- **Sessão real**: `Xvnc` do TigerVNC 1.16 subindo **direto na interface USB**
+  (`-interface 10.55.0.2:5901`), sem `socat` e sem `-localhost`.
+- **O framebuffer real renderiza**: captura de 1024×600 pelo **cliente nativo do projeto**
+  com **99,99 % dos pixels não pretos**; cores dominantes `(49,8,32)` = a parede aubergine
+  `#300a24` quantizada em RGB565 e `(41,0,24)` = o painel tint2 `#2c001e`. O relógio e os
+  **3 launchers** do painel aparecem, e o ponteiro do mouse é desenhado.
+- **Autenticação VncAuth real** aceitada pelo `Xvnc` do aparelho (não por um servidor falso).
+- **Exposição restrita**: o VNC está preso à interface USB — não aparece em `0.0.0.0` nem na
+  interface Wi-Fi.
+- **RAM real medida**: **PSS 73,5 MiB** e **RSS somado 114,6 MiB** em repouso (veja
+  [Memória medida](#memória-medida--e-o-que-ela-não-prova)).
+- **`doctor` no aparelho**: **14 PASS / 0 FAIL**.
+- **Descoberta do host Windows**: o Windows 11 só amarra o driver "Remote NDIS based Internet
+  Sharing Device" quando o RNDIS é a **primeira** interface do gadget (`MI_00`); com o ACM
+  antes, o driver falha com **Code 10** e o PC não alcança o aparelho. O `app.py` passou a
+  garantir a ordem dos links no aparelho e a **conferi-la pelo lado do PC**.
+
 ## O que ainda não foi provado
 
-Não foi validado no **Moto E7 Power físico** — não havia aparelho conectado durante o
-desenvolvimento. Portanto, **isto ainda não foi provado**:
+O Malta Desktop **roda no Moto E7 Power físico**, e o PC **se conecta a ele**: as duas pontas
+estão unidas (veja [Malta Desktop validado no aparelho real](#malta-desktop-validado-no-aparelho-real-moto-e7-power)).
+O que segue **continua pendente**:
 
-- o **build armv7 em execução no aparelho**: os pacotes foram conferidos no APKINDEX e em
-  APKs reais de armv7, mas o `apk --root` no ARMv7 do celular não foi executado;
-- a **RAM real no ARMv7** — a medição de memória é de container x86_64;
-- o **link RNDIS USB real** e a **ponte serial** no aparelho;
-- a **consumação de bateria** e o uso do aparelho como display;
-- a **ponte de teclado `br`**;
-- a **instalação completa via serial**: o `install.sh` foi validado direto no container,
-  não disparado por `/api/cmd` no aparelho real;
-- o **app do Windows falando com o aparelho real**: o teste ponta a ponta foi feito em
-  container x86_64, e o PC **nunca se conectou a um ARMv7** — não existe validação que una as
-  duas pontas (o cliente RFB próprio contra um `Xvnc` armv7 alcançado pelo `socat`);
-- o **custo da serial de 115200 baud** no `measure` em hardware real: o cache por PID resolve
-  o pior caso teórico, mas o tempo de parede do `measure` no aparelho **não foi medido**;
-- o **comportamento do blacklisting do TigerVNC** — quantas falhas de login cada conta
+- **O upload do bundle pelo caminho HTTP do app.** O `install.sh` **foi executado no aparelho
+  real**, disparado pelo `/api/cmd` + serial — que é confiável, porque são comandos pequenos.
+  O que é **frágil** é o *upload* do bundle pelo caminho do app (`POST /api/files/upload`): o
+  arquivo vai em base64, **em blocos de 240 caracteres, um comando serial por bloco**, com
+  timeout de 10 s por bloco, e a serial é de **115200 baud** (~11,5 KB/s). O
+  `device/malta-desktop.sh` (32,8 KB) sozinho vira **~182 comandos**, e o bundle inteiro
+  (~92 KB, 14 arquivos) vira **~513 comandos** — uma sequência longa de ida e volta, em que
+  qualquer queda de cabo ou timeout deixa a gravação pela metade. **Contorno usado**: o
+  bundle foi deixado no `/data` por outro caminho e só o `install.sh` foi disparado pelo
+  `/api/cmd`. O caminho HTTP completo (bundle inteiro pelo app) **ainda não é confiável** em
+  115200 baud.
+- **O desempenho com o cliente real** e a **resposta do teclado `br`** (layout brasileiro): o
+  mouse está comprovado (o ponteiro aparece desenhado no framebuffer real), mas a latência
+  percebida com o cliente RFB próprio e o mapeamento do layout `br` **não foram medidos**.
+- **O consumo de bateria** e o uso do aparelho como display com o VNC no ar.
+- **O logon real do Windows com o autostart**: o `.cmd` da pasta Startup foi criado e removido
+  por script, mas **nenhum logon de verdade** foi observado.
+- **O RNDIS depois de um reinício do celular**: a ordem dos links nasce do `init` do aparelho,
+  que cria o **ACM antes** do RNDIS — o RNDIS nasce em `MI_02` e o Windows falha com **Code
+  10**. O `app.py` corrige a ordem **em runtime**, mas o **ciclo completo de boot**
+  (reboot → ordem errada → correção → link de novo) ainda não foi validado ponta a ponta.
+- **A estabilidade em longos períodos**: não há observação de horas de sessão contínua (o
+  `Xvnc` no aparelho, o monitor do PC e a sessão RFB ao mesmo tempo).
+- **O comportamento do blacklisting do TigerVNC** — quantas falhas de login cada conta
   permite e quanto dura a expiração. O mecanismo foi **evitado** (a sonda TCP crua saiu do
-  caminho), não medido;
-- o **autostart num logon real do Windows**: o `.cmd` da pasta Startup foi criado e removido
-  por script, mas **nenhum logon de verdade** foi observado;
-- a **combinação monitor + cliente**: o bug da sonda TCP só aparecia com o monitor e o
-  cliente RFB **juntos**, e é exatamente esse par que nunca rodou no aparelho real.
+  caminho), não medido.
 
 ## Interface
 
@@ -638,6 +774,13 @@ PC (malta-central)                         Celular (malta)
 Após um reboot do celular, o ciclo 2–6 roda sozinho. O app espera o ACM voltar, recria o RNDIS,
 reconecta e só então marca `prov=ok`.
 
+> **Requisito do host Windows:** o Windows 11 só amarra o driver "Remote NDIS based Internet
+> Sharing Device" quando a função RNDIS é a **primeira** interface do gadget (`MI_00`). Com o
+> ACM antes, o RNDIS nasce em `MI_02` e o driver falha com **Code 10** — nenhum adaptador de
+> rede é criado. O `init` do aparelho cria o ACM antes do RNDIS, então isso volta a cada
+> reinício; o `app.py` corrige a ordem em runtime. Detalhes e o que fazer em
+> [Solução de problemas do desktop](#solução-de-problemas-do-desktop).
+
 ## Windows 10/11 — iniciar a central no PC
 
 O desktop web também roda no Windows. O telefone não precisa ser reflasheado nem ter sua
@@ -656,7 +799,9 @@ acessíveis, mas os recursos que dependem do aparelho aparecem como offline.
 
 > Para ver o **desktop X do celular numa janela nativa do Windows** (sem navegador), use
 > `run_desktop_windows.bat` — veja [Malta Desktop](#malta-desktop--desktop-x-do-celular-numa-janela-do-windows).
-> O app do desktop reaproveita a central que estiver rodando, então os dois podem coexistir.
+> O app do desktop **reaproveita** a central que estiver rodando e só sobe uma cópia oculta
+> quando não há nenhuma. **Não abra os dois ao mesmo tempo**: a serial é um recurso único e a
+> central Flask é a dona dela.
 
 ### Porta serial no Windows
 
@@ -692,6 +837,14 @@ O script espera o adaptador aparecer porque a central pode precisar provisionar 
 pela serial primeiro. **Mantenha a central em execução e só então execute o configurador.**
 Ele não altera adaptadores Wi-Fi/Ethernet de saída, não remove regras NAT existentes e recusa
 continuar se detectar conflito de IP/rota com outra interface.
+
+> **Se o adaptador RNDIS nunca aparece**, o motivo quase sempre é a **ordem das interfaces do
+> gadget**: o Windows 11 só amarra o driver "Remote NDIS based Internet Sharing Device" quando
+> o RNDIS é a **primeira** interface (`MI_00`); com o ACM antes, o driver falha com **Code 10**
+> (`CM_PROB_FAILED_START`) e nenhum adaptador é criado. O `app.py` confere essa ordem pelo
+> lado do PC (via `Get-PnpDevice`) e a corrige no aparelho quando ela está errada. Sintoma,
+> diagnóstico e o que fazer em
+> [Solução de problemas do desktop](#solução-de-problemas-do-desktop).
 
 Se o Windows já estiver usando WinNAT por WSL, Docker, Hyper-V ou outra ferramenta, a criação
 do NAT pode ser rejeitada pelo próprio Windows. Nesse caso o script informa o conflito sem
@@ -1029,13 +1182,12 @@ MC_DISABLE_THREADS=1 venv/bin/python -m unittest discover -s tests -v
 ```
 
 `MC_DISABLE_THREADS=1` evita subir poller/provisionador durante os testes; a serial é falsa e
-o celular não é necessário. São **269 testes** (18 em `test_app.py`, 54 em `test_v3.py`, 7 em
-`test_windows.py`, 90 em `test_desktop.py`, 73 em `test_device_scripts.py` e 27 em
+o celular não é necessário. São **311 testes** (43 em `test_app.py`, 54 em `test_v3.py`, 7 em
+`test_windows.py`, 95 em `test_desktop.py`, 85 em `test_device_scripts.py` e 27 em
 `test_rfb.py`), com **1 skip** pré-existente e alheio ao desktop
 (`test_v3.ApiV3Tests.test_read_ai_key_rejects_symlink_and_non_regular`, pulado porque
 `mkfifo` não existe no Windows). Contagem de 21/10/2026 — o comando acima é a fonte da
-verdade. (O `test_device_scripts.py` tem 74 métodos `def test_`, mas um nome está repetido
-dentro da mesma classe e um dos dois é sobrescrito pelo outro: o que roda são 73.)
+verdade.
 
 A suíte cobre os contratos legados e a v3: política de arquivos e path traversal, links
 simbólicos, confirmação de ações destrutivas, catálogo local, IA sem configuração/redaction,
@@ -1048,6 +1200,7 @@ O Malta Desktop acrescenta estes blocos:
 | `tests/test_rfb.py` | o DES d3des do VncAuth (bits da chave invertidos) conferido contra o binário real do `vncpasswd` do TigerVNC, o formato de pixel RGB565, o handshake RFB 3.8, `CopyRect`/`DesktopSize` e a codificação de teclado e ponteiro |
 | `tests/test_desktop.py` | a máquina de estados (`no_device` → `desktop_ready`), o monitor (uma única sessão, reconexão, queda do cabo), o contrato com a API da central, o limite de 500 caracteres do `/api/cmd`, o bundle, a senha, o autostart e o log |
 | `tests/test_device_scripts.py` | a sintaxe dos scripts (`bash -n`), a ausência de bashismos, o contrato de chaves `KEY=VALOR` entre o aparelho e o PC, o `install.sh` (branch derivada de `/etc/alpine-release`, chroot com as chaves do host, `STATE`/`STEP` do instalador, nada de partições) e as configs de openbox, tint2, pcmanfm e jgmenu |
+| `tests/test_app.py` | a **ordem das interfaces do gadget**: a checagem é feita **no PC** (`Get-PnpDevice`, `&MI_00` × `&MI_02`), o `MI_00` não toca no aparelho, o `MI_02` dispara a correção `rndis → acm`, PnP indisponível não toca em nada, no Linux não há correção, e a correção não entra em laço quando o aparelho volta |
 
 No Windows, o mesmo comando roda direto no `.venv`:
 
@@ -1179,16 +1332,24 @@ A remoção é feita nesta ordem, do PC para o aparelho. Nada é removido às ce
    rmdir /s /q "%LOCALAPPDATA%\malta-central"
    ```
 
-4. **No aparelho, remover o desktop.** Pelo **Terminal** do painel de diagnóstico (a
-   ferramenta secundária) ou por qualquer shell root no aparelho:
+4. **No aparelho, remover o desktop.** O comando roda **no aparelho** (root), não no PC:
+   pelo **Terminal** do painel de diagnóstico (a ferramenta secundária) ou por qualquer
+   shell root:
 
    ```sh
    sh /data/malta-desktop/install.sh --remove --yes
    ```
 
-   O instalador para o desktop, desmonta `/proc`, `/dev`, `/dev/pts`, `/dev/shm` e `/sys`
-   do chroot e apaga `/data/malta-desktop` por completo. É reversível: basta rodar
-   **Instalar/Reparar desktop** de novo para recriar tudo.
+   As **duas flags são obrigatórias** (`--remove --yes`): `--yes` sozinho é recusado, e o
+   instalador se recusa a operar em qualquer caminho diferente de `/data/malta-desktop`.
+
+   O instalador **para o desktop** primeiro, **desmonta** `/dev/pts`, `/dev/shm`, `/dev`,
+   `/proc` e `/sys` do chroot (as submontagens de `/dev` antes do pai, senão ficam
+   penduradas) e só então apaga `/data/malta-desktop` por completo — os ~309 MiB do chroot
+   voltam para o `/data`. É **idempotente**: se `/data` não estiver montado ou o diretório
+   não existir, ele responde "nada a remover" e sai com código 0.
+
+   É reversível: basta rodar **Instalar/Reparar desktop** de novo para recriar tudo.
 
 5. **Confirmar o que não foi tocado.** Nada de **boot**, **partição**, **bootloader** ou
    **firmware** foi alterado em nenhum momento — nem na instalação, nem na remoção. O
@@ -1199,7 +1360,9 @@ A remoção é feita nesta ordem, do PC para o aparelho. Nada é removido às ce
 ## Arquitetura do repositório
 
 ```
-app.py                         backend Flask: serial, provisionamento, probe, APIs e guard
+app.py                         backend Flask: serial, provisionamento, probe, APIs e guard;
+                               também confere/corrige a ordem das interfaces do gadget
+                               (RNDIS antes do ACM) pelo lado do Windows
 malta_files.py                 política de caminhos, leitura/escrita/transferência
 malta_diagnostics.py           inventário do sistema e da rede
 malta_catalog.py               catálogo embutido/local e verificação de estados
@@ -1211,7 +1374,9 @@ malta_rfb.py                   cliente RFB 3.8 próprio (VncAuth, framebuffer, t
 device/malta-desktop.sh        start/stop/restart/status/measure/doctor/log no aparelho
 device/install.sh              instalador idempotente do chroot em /data (+ --remove --yes)
 device/session.sh              sessão X do chroot (openbox, tint2, pcmanfm) com supervisão
-device/config/*                rc do openbox, tint2rc, pcmanfm.conf, jgmenurc, CSV e XPM
+device/config/*                rc do openbox, tint2rc, pcmanfm.conf, jgmenurc e CSV
+device/config/applications/*   launchers próprios (.desktop) do pcmanfm, xterm e jgmenu
+device/config/icons/*          os três XPM próprios (~8 KB) do painel e do menu
 templates/index.html           shell desktop (carrega apenas /static/js/app.js)
 static/css/desktop.css         tokens, shell, componentes e responsivo
 static/js/api.js               cliente HTTP e contratos
@@ -1221,12 +1386,14 @@ static/js/router.js            rotas por hash e ciclo de vida das views
 static/js/app.js               navegação, chips, statusbar, paleta e atalhos
 static/js/views/*.js           home, files, terminal, system, network, apps, assistant,
                                events, settings
-tests/test_app.py              18 testes legados (serial falsa)
+tests/test_app.py              43 testes legados (serial falsa) + ordem das interfaces do
+                               gadget (MI_00 × MI_02, Get-PnpDevice)
 tests/test_v3.py               54 testes da v3 (política, catálogo, IA, segurança)
 tests/test_windows.py          7 testes da descoberta de porta COM no Windows
-tests/test_desktop.py          90 testes do app Windows (estados, monitor, autostart, senha)
-tests/test_device_scripts.py   73 testes dos scripts e das configs do aparelho
+tests/test_desktop.py          95 testes do app Windows (estados, monitor, autostart, senha)
+tests/test_device_scripts.py   85 testes dos scripts e das configs do aparelho
 tests/test_rfb.py              27 testes do cliente RFB (DES d3des, pixel, handshake, entrada)
+run_windows.bat                lançador do painel web no Windows (cria o .venv)
 run_desktop_windows.bat        lançador do Malta Desktop no Windows (cria o .venv)
 tools/malta_desktop_autostart.bat  atalho para o .ps1 (-Install | -Remove | -Status)
 tools/malta_desktop_autostart.ps1  .cmd na pasta Startup do usuário (sem registro, sem UAC)
@@ -1234,6 +1401,7 @@ reverse_tether_host.sh         fallback manual do PC Linux
 setup_windows_network.bat      configurador RNDIS + NAT Windows
 setup_windows_network.ps1      IP 10.55.0.1 e WinNAT no adaptador RNDIS
 reverse_tether_cell.sh         fallback manual do celular (RNDIS)
+.github/workflows/tests.yml    CI: unittest em Linux e Windows + sintaxe dos .ps1
 .env.example                   variáveis de ambiente, sem credenciais
 catalog.local.example.json     exemplo de catálogo local (link e serviço TCP)
 requirements.txt               flask, pyserial, pillow

@@ -29,7 +29,9 @@ import base64
 import json
 import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -825,6 +827,15 @@ def cached_status() -> dict:
 # Criado antes de linkar a função: sem refcnt, os atributos MAC/ifname
 # aceitam escrita. MACs fixos tornam o nome da interface do PC estável
 # (enx020000000001) e permitem um perfil NetworkManager permanente.
+#
+# Ordem dos links no config: o Windows 11 so amarra o driver "Remote NDIS"
+# quando a funcao RNDIS e a PRIMEIRA interface do gadget (MI_00). Com o ACM
+# antes, o RNDIS cai em MI_02 (o CDC ACM ocupa MI_00 e MI_01) e o driver
+# "Remote NDIS" falha ao iniciar (CM_PROB_FAILED_START, Code 10): o
+# adaptador de rede nunca e criado e o PC nao alcanca o aparelho. O configfs
+# anexa cada link no fim da lista, entao a ordem so muda deslinkando os dois
+# e religando em rndis -> acm. A funcao acm.gs0 (o console serial) nunca e
+# removida: so o link e refeito, e logo em seguida.
 PROV_SCRIPT = (
     "G=/sys/kernel/config/usb_gadget/g1; "
     "U=$(cat $G/UDC); [ -n \"$U\" ] || U=musb-hdrc; "
@@ -835,9 +846,11 @@ PROV_SCRIPT = (
     "echo 02:00:00:00:00:01 > $G/functions/rndis.usb0/host_addr; "
     # O default do usb_f_rndis já é rndis0; ifname é read-only neste kernel.
     "fi; "
-    "if [ ! -L $G/configs/c.1/rndis.usb0 ]; then "
-    "cd $G; ln -s functions/rndis.usb0 configs/c.1/rndis.usb0; cd /; "
-    "fi; "
+    "rm -f $G/configs/c.1/rndis.usb0; "
+    "cd $G; ln -s functions/rndis.usb0 configs/c.1/rndis.usb0; "
+    "if [ -d functions/acm.gs0 ]; then "
+    "rm -f configs/c.1/acm.gs0; ln -s functions/acm.gs0 configs/c.1/acm.gs0; "
+    "fi; cd /; "
     "sleep 1; "
     "echo $U > $G/UDC; "
     "sleep 3; "
@@ -847,8 +860,8 @@ PROV_SCRIPT = (
     "printf \"nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n\" > /etc/resolv.conf"
 )
 
-# Recria a função do zero: necessário para aplicar os MACs fixos quando a
-# função atual foi criada com MACs aleatórios. O unbind derruba a serial.
+# Recria a funcao do zero: necessario para aplicar os MACs fixos quando a
+# funcao atual foi criada com MACs aleatorios. O unbind derruba a serial.
 PROV_FORCE_SCRIPT = (
     "G=/sys/kernel/config/usb_gadget/g1; "
     "echo \"\" > $G/UDC; sleep 1; "
@@ -856,6 +869,15 @@ PROV_FORCE_SCRIPT = (
     "rmdir $G/functions/rndis.usb0 2>/dev/null; "
     + PROV_SCRIPT
 )
+
+# O app envia comandos com no maximo 500 caracteres (regra do /api/cmd) e o
+# script do provisionamento e maior que isso. Ele nao pode ser quebrado em
+# comandos executados um a um: o unbind do UDC derruba a serial do aparelho
+# no meio do caminho. A saida e escrever o script num arquivo do aparelho
+# (comandos curtos, enquanto a serial ainda esta de pe) e executa-lo detached
+# num comando so.
+CMD_LIMIT = 500
+PROV_SCRIPT_FILE = "/tmp/rndis.sh"
 
 CONFIG_RNDIS_CMD = (
     "ip addr add 10.55.0.2/24 dev rndis0 2>/dev/null; "
@@ -897,18 +919,403 @@ def provision_now() -> None:
     log_event("provisionamento RNDIS solicitado manualmente", "info")
 
 
+def sh_quote(texto: str) -> str:
+    """Argumento literal do shell: o texto vai entre aspas simples."""
+    return "'" + texto.replace("'", "'\\''") + "'"
+
+
+def split_script(script: str, tamanho: int) -> list[str]:
+    """Fatia o script em blocos de no maximo `tamanho` caracteres.
+
+    O corte prefere a fronteira de um "; " (o script e uma linha so de
+    comandos); sem fronteira, o bloco e cortado no limite.
+    """
+    blocos: list[str] = []
+    resto = script
+    while resto:
+        if len(resto) <= tamanho:
+            blocos.append(resto)
+            break
+        corte = resto.rfind("; ", 0, tamanho + 1)
+        corte = corte + 2 if corte > 0 else tamanho
+        blocos.append(resto[:corte])
+        resto = resto[corte:]
+    return blocos
+
+
+def provision_commands(script: str, arquivo: str = PROV_SCRIPT_FILE,
+                       limite: int = CMD_LIMIT,
+                       log: str = "/tmp/rndis.log") -> list[str]:
+    """Comandos que levam o script de provisionamento ate o aparelho.
+
+    O primeiro comando limpa o arquivo, os seguintes escrevem o script em
+    blocos (cada um dentro do limite de comandos do app) e o ultimo executa
+    o arquivo detached: e o unbind do UDC que derruba a serial, e um script
+    solto no meio da comunicacao nunca chegaria ao fim.
+    """
+    comandos = [f"rm -f {arquivo}"]
+    tamanho = limite - len(f"printf '%s' '' >> {arquivo}")
+    for bloco in split_script(script, tamanho):
+        comandos.append(f"printf '%s' {sh_quote(bloco)} >> {arquivo}")
+    comandos.append(
+        f"(sleep 1; nohup sh {arquivo} </dev/null >{log} 2>&1 &)"
+    )
+    return comandos
+
+
 def send_provision(force: bool = False) -> None:
     script = PROV_FORCE_SCRIPT if force else PROV_SCRIPT
-    cmd = f"(sleep 1; nohup sh -c '{script}' </dev/null >/tmp/rndis.log 2>&1 &)"
-    ok, out, _ = malta.run(cmd, timeout=8)
-    if not ok:
-        # Esperado: o unbind do gadget derruba a serial antes do marker.
-        tag = "forçado" if force else "normal"
-        log_event(f"provisionamento {tag} enviado (serial reenumerou: {out})", "info")
+    comandos = provision_commands(script)
+    for comando in comandos[:-1]:
+        ok, out, _ = malta.run(comando, timeout=8)
+        if not ok:
+            # Um script pela metade religaria o gadget sem o link do console.
+            log_event(f"provisionamento abortado: escrita falhou ({out})", "error")
+            set_prov("error", f"escrita do script de provisionamento falhou: {out}")
+            return
+    malta.run(comandos[-1], timeout=8)
+    tag = "forçado" if force else "normal"
+    log_event(f"provisionamento {tag} enviado ({PROV_SCRIPT_FILE})", "info")
 
 
 def configure_rndis():
     return malta.run(CONFIG_RNDIS_CMD, timeout=8)
+
+
+# ---------------------------------------------------------------------------
+# Ordem dos links do gadget (RNDIS antes do ACM)
+# ---------------------------------------------------------------------------
+# O Windows 11 so amarra o driver "Remote NDIS" quando a funcao RNDIS e a
+# PRIMEIRA interface do gadget (MI_00). O init do aparelho cria o ACM
+# primeiro, entao a cada boot o RNDIS nasce em MI_02 e o driver falha ao
+# iniciar (Code 10): nenhum adaptador de rede e criado no PC. O configfs
+# anexa cada link no fim da lista, entao a ordem so volta ao wanted
+# deslinkando os dois e religando em rndis -> acm.
+#
+# O provisionamento completo (PROV_SCRIPT) ja religa na ordem certa, mas ele
+# so roda quando o provisionamento inteiro acontece. O init do aparelho ja
+# cria a funcao RNDIS no boot: nesse caso o app so configura o IP
+# (CONFIG_RNDIS_CMD) e a ordem errada volta a cada reinicio do celular.
+#
+# A ordem e conferida NO PC, nunca no aparelho. O configfs (kernfs) nao
+# preserva a ordem de criacao dos links: o readdir devolve a ordem de hash
+# do kernfs, que nao e a ordem das interfaces (medido no Moto E7 Power: o
+# 'find' traz acm.gs0 primeiro, mas o Windows amarrou o RNDIS em MI_00).
+# Ler o diretorio, portanto, nao diz nada sobre a ordem que o Windows ve —
+# e ainda quebra em busybox, onde 'ls -U' nao existe (imprime o usage, a
+# leitura volta vazia e a central derruba a serial em laco).
+#
+# Quem sabe a ordem de verdade e o proprio Windows: o device RNDIS aparece
+# no Gerenciador de Dispositivos como "Remote NDIS based Internet Sharing
+# Device" (ou "Remote NDIS Compatible Device") e o InstanceId carrega a
+# interface do gadget: USB\VID_1D6B&PID_0104&MI_00\<instancia>.
+# MI_00 = ordem certa (RNDIS primeiro); MI_02 = ordem errada (ACM primeiro).
+#
+# Se a consulta ao PnP falhar (modulo PnpDevice ausente, execucao sem
+# permissao, dispositivo ainda nao enumerado), o resultado e "unknown" e
+# NADA e tocado no gadget: derrubar a serial sem certeza seria pior do que
+# a ordem errada.
+#
+# Em Linux a ordem das interfaces do gadget nao muda nada (o kernel nomeia
+# as interfaces pelo driver, nao pela ordem do link) e o projeto foi validado
+# no Linux: ali a checagem e sempre "ok" e o gadget nunca e tocado.
+#
+# A correcao precisa derrubar a serial (o unbind do UDC exige o gadget
+# desligado), entao ela acontece no maximo uma vez por janela: sem isso a
+# correcao derruba a serial, o aparelho volta, o ciclo recomeca e a
+# correcao se repete para sempre.
+
+# Correcao da ordem: desliga o UDC, deslinka os dois, religa em rndis -> acm
+# e religa o UDC. A funcao do console (acm.gs0) nunca e removida: so o link e
+# refeito, e logo em seguida — e e ela que da a serial de volta. O IP do
+# rndis0 volta junto: o unbind/relink recria a interface.
+ORDER_FIX_SCRIPT = (
+    "G=/sys/kernel/config/usb_gadget/g1; "
+    "U=$(cat $G/UDC); [ -n \"$U\" ] || U=musb-hdrc; "
+    "if [ -n \"$(cat $G/UDC)\" ]; then echo \"\" > $G/UDC; sleep 1; fi; "
+    "rm -f $G/configs/c.1/rndis.usb0; "
+    "cd $G; ln -s functions/rndis.usb0 configs/c.1/rndis.usb0; "
+    "if [ -d functions/acm.gs0 ]; then "
+    "rm -f configs/c.1/acm.gs0; ln -s functions/acm.gs0 configs/c.1/acm.gs0; "
+    "fi; cd /; "
+    "sleep 1; "
+    "echo $U > $G/UDC; "
+    "sleep 3; "
+    "ip addr add 10.55.0.2/24 dev rndis0 2>/dev/null; "
+    "ip link set rndis0 up; "
+    "ip route add default via 10.55.0.1 2>/dev/null; "
+    "printf \"nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n\" > /etc/resolv.conf"
+)
+
+ORDER_FIX_FILE = "/tmp/order.sh"
+ORDER_FIX_LOG = "/tmp/order.log"
+#: Janela em que a queda da serial causada pela correcao conta como o mesmo
+#: ciclo de conexao (o aparelho volta em poucos segundos). Passada a janela,
+#: um boot novo do celular abre um ciclo novo e a correcao pode rodar de novo.
+ORDER_FIX_WINDOW_S = 120.0
+#: Intervalo minimo entre duas consultas ao PnP do Windows quando o
+#: resultado e "unknown" (pode ser transitorio: o device RNDIS ainda nao
+#: enumerou depois do boot do celular).
+ORDER_RECHECK_S = 30.0
+
+#: Script PowerShell que lista os InstanceIds dos dispositivos RNDIS
+#: presentes. As marcadores delimitam a saida valida: se o comando falhar
+#: (modulo PnpDevice ausente, execucao negada), os marcadores nao vem e a
+#: checagem vira "unknown" — nunca "bad" por bug de parsing.
+#:
+#: O filtro e pelo nome do device ("Remote NDIS based Internet Sharing
+#: Device", "Remote NDIS Compatible Device") e nao pelo InstanceId: o ACM
+#: do gadget tambem e USB\VID_1D6B&PID_0104&MI_02, e casar por ele daria
+#: uma ordem errada que derrubaria a serial sem parar.
+PNP_BEGIN_MARK = "MC_RNDIS_BEGIN"
+PNP_END_MARK = "MC_RNDIS_END"
+PNP_QUERY_CMD = (
+    "$ErrorActionPreference='Stop'; "
+    "$ids = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | "
+    "Where-Object { $_.FriendlyName -like '*NDIS*' } | "
+    "ForEach-Object { $_.InstanceId }); "
+    f"'{PNP_BEGIN_MARK}'; $ids; '{PNP_END_MARK}'"
+)
+
+ORDER_LOCK = threading.Lock()
+ORDER_STATE = {"checked": False, "order": "", "checked_at": 0.0,
+               "fixed": False, "fixed_at": 0.0}
+
+
+def parse_rndis_instance_ids(output: str) -> list[str] | None:
+    """InstanceIds dos dispositivos RNDIS reportados pelo PnP do Windows.
+
+    None = a consulta falhou (as marcadores nao apareceram); [] = a consulta
+    rodou e nao ha dispositivo RNDIS presente no PC.
+    """
+    texto = str(output or "")
+    inicio = texto.find(PNP_BEGIN_MARK)
+    if inicio < 0:
+        return None
+    fim = texto.find(PNP_END_MARK, inicio + len(PNP_BEGIN_MARK))
+    if fim < 0:
+        return None
+    ids = []
+    for linha in texto[inicio + len(PNP_BEGIN_MARK):fim].splitlines():
+        linha = linha.strip()
+        if linha:
+            ids.append(linha)
+    return ids
+
+
+def parse_rndis_interface(instance_id: str) -> int | None:
+    """Numero da interface do gadget (MI_xx) de um InstanceId do Windows.
+
+    "USB\\VID_1D6B&PID_0104&MI_00\\..." -> 0 (o RNDIS na primeira interface).
+    O no composto do USB (sem "&MI_") devolve None: ele nao diz nada sobre
+    a ordem das interfaces.
+    """
+    match = re.search(r"&MI_(\d+)", str(instance_id or ""), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _powershell_executable() -> str:
+    """O powershell do Windows (Windows PowerShell 5.1 ou PowerShell Core)."""
+    return shutil.which("powershell.exe") or shutil.which("pwsh") or ""
+
+
+def pnp_rndis_instance_ids() -> list[str] | None:
+    """InstanceIds dos dispositivos RNDIS presentes (None = consulta falhou).
+
+    A consulta ao PnP nao exige privilegio: 'Get-PnpDevice' lista os
+    dispositivos instalados do PC. Ainda assim, se o modulo PnpDevice
+    faltar ou a execucao for negada, o resultado e None e a central nao
+    mexe no gadget (nunca no escuro).
+    """
+    executavel = _powershell_executable()
+    if not executavel:
+        return None
+    try:
+        resultado = subprocess.run(
+            [executavel, "-NoProfile", "-NonInteractive", "-Command", PNP_QUERY_CMD],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if resultado.returncode != 0:
+        return None
+    return parse_rndis_instance_ids(resultado.stdout)
+
+
+def windows_rndis_order(instance_ids: list[str] | None) -> str:
+    """Ordem da interface RNDIS vista pelo Windows.
+
+    "ok" = o RNDIS esta na MI_00 (primeira interface do gadget);
+    "bad" = o RNDIS esta em outra MI (o ACM foi ligado antes);
+    "unknown" = a consulta ao PnP falhou ou nao ha dispositivo RNDIS.
+
+    O Windows expoe mais de um device com "NDIS" no nome (o barramento
+    virtual do RNDIS, por exemplo). So os que carregam "&MI_xx" entram na
+    conta — o numero da interface e o do link do gadget — e vale o menor
+    deles: um RNDIS em MI_00 e a ordem certa, mesmo que sobre um node
+    antigo de outra sessao.
+    """
+    if not instance_ids:
+        return "unknown"
+    interfaces = [
+        numero for numero in
+        (parse_rndis_interface(item) for item in instance_ids)
+        if numero is not None
+    ]
+    if not interfaces:
+        return "unknown"
+    return "ok" if min(interfaces) == 0 else "bad"
+
+
+def host_platform() -> str:
+    """Plataforma do PC: 'nt' no Windows, 'posix' no Linux."""
+    return os.name
+
+
+def check_gadget_order() -> str:
+    """Confere a ordem dos links do gadget pelo lado do PC.
+
+    No Windows a resposta vem do PnP (a interface em que o Windows amarrou
+    o RNDIS). Em outros sistemas a ordem das interfaces nao importa: a
+    checagem e "ok" e o gadget nunca e tocado.
+    """
+    if host_platform() not in ("nt", "win32", "windows"):
+        return "ok"
+    try:
+        return windows_rndis_order(pnp_rndis_instance_ids())
+    except Exception:  # pragma: no cover - a consulta ao PnP nunca derruba a central
+        return "unknown"
+
+
+def send_gadget_order_fix() -> bool:
+    """Envia o script que religa o gadget na ordem rndis -> acm.
+
+    O script vai para o aparelho em blocos (limite de 500 caracteres) e roda
+    detached: o unbind do UDC derruba a serial no meio do caminho.
+    """
+    comandos = provision_commands(ORDER_FIX_SCRIPT, arquivo=ORDER_FIX_FILE,
+                                  log=ORDER_FIX_LOG)
+    for comando in comandos[:-1]:
+        ok, out, _ = malta.run(comando, timeout=8)
+        if not ok:
+            log_event(f"correcao da ordem do gadget abortada: {out}", "error")
+            return False
+    malta.run(comandos[-1], timeout=8)
+    log_event("ordem do gadget corrigida: RNDIS antes do ACM", "info")
+    return True
+
+
+def begin_gadget_order_cycle() -> None:
+    """Abre um ciclo de conexao para a ordem dos links do gadget.
+
+    A queda da serial que a propria correcao provoca nao pode contar como
+    um ciclo novo: a correcao derruba a serial, o aparelho volta e o ciclo
+    recomecaria — e a correcao se repetiria para sempre. A janela
+    ORDER_FIX_WINDOW_S separa "o aparelho que voltou da correcao" de "um
+    boot novo de verdade".
+    """
+    with ORDER_LOCK:
+        mesmo_ciclo = (
+            ORDER_STATE["fixed"]
+            and (time.time() - ORDER_STATE["fixed_at"]) < ORDER_FIX_WINDOW_S
+        )
+        ORDER_STATE["checked"] = False
+        ORDER_STATE["order"] = ""
+        if not mesmo_ciclo:
+            ORDER_STATE["fixed"] = False
+            ORDER_STATE["fixed_at"] = 0.0
+
+
+def _gadget_order_check_needed() -> bool:
+    """Diz se a checagem do PC precisa rodar de novo.
+
+    "ok" nao muda sozinho: so um boot novo do celular (que abre um ciclo
+    novo) reinicia a leitura. "unknown" pode ser transitorio (o device
+    RNDIS ainda nao enumerou depois do boot): a leitura e refeita depois de
+    ORDER_RECHECK_S. "bad" so volta a ser lido depois da janela da ultima
+    correcao — e a correcao so se repete se a leitura continuar dizendo
+    "bad".
+    """
+    with ORDER_LOCK:
+        if not ORDER_STATE["checked"]:
+            return True
+        agora = time.time()
+        ordem = ORDER_STATE["order"]
+        if ordem == "bad":
+            if (ORDER_STATE["fixed"]
+                    and (agora - ORDER_STATE["fixed_at"]) < ORDER_FIX_WINDOW_S):
+                return False
+            return True
+        if ordem == "unknown":
+            return (agora - ORDER_STATE["checked_at"]) >= ORDER_RECHECK_S
+        return False
+
+
+def ensure_gadget_order() -> str:
+    """Confere a ordem dos links do gadget e corrige uma vez por janela.
+
+    Devolve a ordem vista: "ok", "bad" ou "unknown". A correcao so acontece
+    quando a ordem esta errada de verdade (o PC respondeu "bad"); com
+    "unknown" nada e tocado, porque derrubar a serial sem saber o que ha
+    na frente seria pior do que a ordem errada.
+
+    A correcao derruba a serial por alguns segundos (o unbind do UDC): o
+    aparelho volta, o ciclo recomeca e a checagem roda de novo. Dentro da
+    janela ORDER_FIX_WINDOW_S a correcao nao se repete; passada a janela,
+    ela so se repete se uma checagem nova continuar dizendo "bad".
+    """
+    if not _gadget_order_check_needed():
+        with ORDER_LOCK:
+            return ORDER_STATE["order"]
+
+    ordem = check_gadget_order()
+
+    with ORDER_LOCK:
+        agora = time.time()
+        anterior = ORDER_STATE["order"]
+        ORDER_STATE["checked"] = True
+        ORDER_STATE["order"] = ordem
+        ORDER_STATE["checked_at"] = agora
+        ja_corrigido = False
+        if ordem == "ok":
+            # A ordem esta certa: um erro novo pode ser corrigido de novo.
+            ORDER_STATE["fixed"] = False
+            ORDER_STATE["fixed_at"] = 0.0
+        elif ordem == "bad":
+            dentro_da_janela = (
+                ORDER_STATE["fixed"]
+                and (agora - ORDER_STATE["fixed_at"]) < ORDER_FIX_WINDOW_S
+            )
+            ja_corrigido = dentro_da_janela
+            if not ja_corrigido:
+                ORDER_STATE["fixed"] = True
+                ORDER_STATE["fixed_at"] = agora
+
+    if ordem == "unknown":
+        # A leitura volta de tempos em tempos (pode ser transitorio): o
+        # aviso sai so na virada, nao a cada tentativa.
+        if anterior != "unknown":
+            log_event("nao deu para ler a ordem dos links do gadget "
+                      "(PnP do Windows)", "warn")
+        return ordem
+    if ordem == "ok":
+        return ordem
+    if ja_corrigido:
+        # A correcao deste ciclo ja rodou: nao repetir (o unbind do UDC
+        # derruba a serial e o aparelho volta em um ciclo novo).
+        log_event(
+            "a ordem dos links do gadget continua errada depois da correcao "
+            "- use 'Provisionar RNDIS'",
+            "warn",
+        )
+        return ordem
+    if not send_gadget_order_fix():
+        # O script nem chegou no aparelho: nada foi mexido no gadget, entao
+        # a proxima volta pode tentar de novo.
+        with ORDER_LOCK:
+            ORDER_STATE["fixed"] = False
+            ORDER_STATE["fixed_at"] = 0.0
+    return ordem
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1442,9 @@ def provisioner() -> None:
                     PROV["attempts"] = 0
                     if PROV["state"] != "running":
                         PROV["state"] = "unknown"
+                # Ciclo novo de conexao: a ordem dos links do gadget volta
+                # a ser conferida (e pode ser corrigida de novo).
+                begin_gadget_order_cycle()
             was_online = online
             if not online:
                 continue
@@ -1043,6 +1453,14 @@ def provisioner() -> None:
                 force = bool(PROV["force"])
             if not SETTINGS.get("auto_provision", True) and not force:
                 continue
+
+            # A ordem dos links (rndis antes do acm) e o que faz o Windows
+            # amarrar o driver "Remote NDIS": o init do aparelho cria o ACM
+            # primeiro, entao a ordem errada volta a cada boot. O
+            # provisionamento forcado ja religa na ordem certa, entao a
+            # checagem nao compete com ele.
+            if not force:
+                ensure_gadget_order()
 
             if status.get("rndis_ip") and not force:
                 with PROV_LOCK:

@@ -2,8 +2,8 @@
 # Instalador idempotente do Malta Desktop no aparelho (Alpine armv7, root).
 #
 # Instala um chroot Alpine persistente em /data/malta-desktop/root e deixa
-# prontos o servidor VNC, o proxy socat e a sessão X. O rootfs do aparelho é
-# um initramfs em RAM; nada aqui é instalado fora de /data.
+# prontos o servidor VNC e a sessão X. O rootfs do aparelho é um initramfs em
+# RAM; nada aqui é instalado fora de /data.
 #
 # Uso (root):
 #   sh /data/malta-desktop/install.sh
@@ -42,8 +42,10 @@ LOCK=$RUN/install.lock
 BUNDLE_LABEL=1
 MIN_FREE_KB=204800
 MIRROR=${MALTA_ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}
-PACKAGES="alpine-baselayout busybox openbox tint2 jgmenu pcmanfm xterm font-dejavu hicolor-icon-theme tigervnc socat xset xsetroot setxkbmap xkeyboard-config xkbcomp"
-REQUIRED_BINS="/bin/sh /usr/bin/Xvnc /usr/bin/vncpasswd /usr/bin/socat /usr/bin/openbox /usr/bin/tint2 /usr/bin/pcmanfm /usr/bin/xterm /usr/bin/jgmenu_run /usr/bin/xset /usr/bin/xsetroot /usr/bin/setxkbmap /usr/bin/xkbcomp"
+# O Xvnc escuta direto na interface USB (10.55.0.2:5901): nao ha proxy no
+# meio, e por isso o pacote socat saiu da lista.
+PACKAGES="alpine-baselayout busybox openbox tint2 jgmenu pcmanfm xterm font-dejavu hicolor-icon-theme tigervnc xset xsetroot setxkbmap xkeyboard-config xkbcomp"
+REQUIRED_BINS="/bin/sh /usr/bin/Xvnc /usr/bin/vncpasswd /usr/bin/openbox /usr/bin/tint2 /usr/bin/pcmanfm /usr/bin/xterm /usr/bin/jgmenu_run /usr/bin/xset /usr/bin/xsetroot /usr/bin/setxkbmap /usr/bin/xkbcomp"
 
 STEP=start
 BRANCH=
@@ -430,7 +432,7 @@ for bin in $REQUIRED_BINS; do
 done
 [ -n "$MISSING" ] && fail "binários ausentes no chroot:$MISSING"
 
-for dest in /usr/bin/Xvnc /usr/bin/socat /usr/local/bin/malta-session /etc/xdg/openbox/rc.xml \
+for dest in /usr/bin/Xvnc /usr/local/bin/malta-session /etc/xdg/openbox/rc.xml \
     /etc/xdg/openbox/menu.xml /etc/xdg/tint2/tint2rc /etc/xdg/pcmanfm/default/pcmanfm.conf \
     /etc/xdg/jgmenu/jgmenurc /etc/xdg/jgmenu/jgmenu-apps.csv \
     /usr/share/icons/hicolor/48x48/apps/malta-files.xpm \

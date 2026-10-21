@@ -1156,21 +1156,109 @@ class HealthProbeTests(unittest.TestCase):
         self.assertEqual(monitor.state.phase, "desktop_ready")
         self.assertIsNotNone(monitor.session)
 
-    def test_device_ready_uses_state_x_ready_and_socat(self):
+    def test_device_ready_uses_state_and_x_ready(self):
+        """O X_READY e o sinal autoritativo; o SOCAT_PID nao decide mais.
+
+        O script novo do aparelho nao tem proxy: o Xvnc escuta direto na
+        interface USB (10.55.0.2:5901) e o status reporta SOCAT_PID=0
+        sempre. Exigir SOCAT_PID != 0 deixaria o app achando que o desktop
+        nunca fica pronto.
+        """
         api = FakeApi()
         service, _calls = self.build(api, tcp_check=lambda *a: True)
         self.assertTrue(service.device_ready({
-            "STATE": "running", "X_READY": "1", "SOCAT_PID": "4242",
+            "STATE": "running", "X_READY": "1", "SOCAT_PID": "0",
         }))
         self.assertFalse(service.device_ready({
             "STATE": "running", "X_READY": "0", "SOCAT_PID": "4242",
         }))
         self.assertFalse(service.device_ready({
-            "STATE": "running", "X_READY": "1", "SOCAT_PID": "0",
-        }))
-        self.assertFalse(service.device_ready({
             "STATE": "stopped", "X_READY": "1", "SOCAT_PID": "4242",
         }))
+
+
+class ReadinessSignalTests(unittest.TestCase):
+    """A prontidão vem do X_READY; o SOCAT_PID sobra como diagnóstico.
+
+    O script novo do aparelho não tem proxy: o Xvnc escuta direto na
+    interface USB (10.55.0.2:5901) e o status reporta SOCAT_PID=0 sempre.
+    O X_READY é o sinal autoritativo — o aparelho só o marca quando o xset
+    responde dentro do prazo. Aparelho com o script antigo (sem X_READY no
+    status) continua usando o critério de sempre: o proxy de pé.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def build(self, api, tcp_check=None):
+        service, _calls = build_service(api, bundle=dict(BUNDLE_MINIMO),
+                                        tcp_check=tcp_check or (lambda *a: True),
+                                        tmp=self.tmp)
+        api.set_version(service.local_bundle_fingerprint())
+        return service
+
+    def test_ready_without_socat(self):
+        service = self.build(FakeApi())
+        self.assertTrue(service.device_signal_ready({
+            "STATE": "running", "X_READY": "1", "SOCAT_PID": "0",
+        }))
+        self.assertTrue(service.device_ready({
+            "STATE": "running", "X_READY": "1", "SOCAT_PID": "0",
+        }))
+
+    def test_not_ready_when_x_is_not_ready(self):
+        service = self.build(FakeApi())
+        self.assertFalse(service.device_signal_ready({
+            "STATE": "running", "X_READY": "0", "SOCAT_PID": "4242",
+        }))
+        self.assertFalse(service.device_ready({
+            "STATE": "running", "X_READY": "0", "SOCAT_PID": "4242",
+        }))
+
+    def test_state_must_be_running(self):
+        service = self.build(FakeApi())
+        for estado in ("stopped", "starting", "degraded", "error", ""):
+            with self.subTest(estado=estado):
+                device = {"STATE": estado, "X_READY": "1", "SOCAT_PID": "0"}
+                self.assertFalse(service.device_signal_ready(device))
+                self.assertFalse(service.device_ready(device))
+
+    def test_legacy_device_keeps_the_socat_criterion(self):
+        """Sem X_READY (script antigo) vale o proxy de pé."""
+        service = self.build(FakeApi())
+        self.assertTrue(service.device_signal_ready({
+            "STATE": "running", "SOCAT_PID": "4242",
+        }))
+        self.assertFalse(service.device_signal_ready({
+            "STATE": "running", "SOCAT_PID": "0",
+        }))
+        self.assertTrue(service.device_ready({
+            "STATE": "running", "SOCAT_PID": "4242",
+        }))
+        self.assertFalse(service.device_ready({
+            "STATE": "running", "SOCAT_PID": "0",
+        }))
+
+    def test_derive_state_follows_the_new_criterion(self):
+        """STATE=running com X_READY=1 é desktop_ready, mesmo sem proxy."""
+        service = self.build(FakeApi())
+        versao = service.local_bundle_fingerprint()
+        device = {"STATE": "running", "X_READY": "1", "SOCAT_PID": "0",
+                  "INSTALLED": "1"}
+        vnc_ready = service.device_ready(device)
+        self.assertTrue(vnc_ready)
+        estado = core.derive_state(dict(HEALTH_ONLINE), dict(STATUS_ONLINE),
+                                   device, {}, vnc_ready, bundle_version=versao)
+        self.assertEqual(estado.phase, "desktop_ready")
+        # Sem o X_READY o aparelho nao confirma: o desktop nao fica pronto.
+        device = {"STATE": "running", "X_READY": "0", "SOCAT_PID": "4242",
+                  "INSTALLED": "1"}
+        vnc_ready = service.device_ready(device)
+        self.assertFalse(vnc_ready)
+        estado = core.derive_state(dict(HEALTH_ONLINE), dict(STATUS_ONLINE),
+                                   device, {}, vnc_ready, bundle_version=versao)
+        self.assertEqual(estado.phase, "desktop_stopped")
 
 
 class StartPathTests(unittest.TestCase):
