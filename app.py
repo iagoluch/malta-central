@@ -55,7 +55,7 @@ import malta_catalog
 import malta_diagnostics
 import malta_files
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 BAUD = 115200
 MARKER = "__MC%d_DONE__"
 EXIT_TOKEN = "__MCXI"

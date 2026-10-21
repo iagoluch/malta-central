@@ -1,4 +1,4 @@
-# malta-central v3.1
+# malta-central v3.2
 
 **Desktop web local para administrar o Alpine Linux nativo do Motorola Moto E7 Power
 (XT2097-5, "malta")** — shell root, arquivos, diagnóstico, catálogo e um assistente de IA
@@ -26,7 +26,7 @@ Testado ao vivo em 19–20/10/2026:
 - **Reboot do celular testado**: após reiniciar, o app recriou o RNDIS com os MACs fixos,
   reconfigurou IP/rota/DNS, montou `/data` e voltou a `prov=ok` sem intervenção.
 - `sysrq b` é o reset que funciona; o `reboot` do BusyBox é ignorado pelo init do aparelho.
-- **50 testes automatizados** passando (`unittest`), incluindo política de arquivos,
+- **79 testes automatizados** passando em Linux e Windows (`unittest`), incluindo política de arquivos,
   confirmação de ações, catálogo e IA.
 
 ## Interface
@@ -112,15 +112,29 @@ As configurações locais e a chave da IA ficam em
 `%LOCALAPPDATA%\malta-central`, fora do clone do Git. As permissões de segredo usam as
 ACLs do perfil de usuário do Windows; os modos POSIX `0600` não se aplicam ao NTFS.
 
-### Limite da compatibilidade Windows
+### RNDIS e Internet pelo cabo USB no Windows
 
-O launcher configura o aplicativo web e a conexão serial. Ele **não configura automaticamente
-o compartilhamento de internet/NAT do Windows para a interface RNDIS**. Essa parte do
-procedimento documentado — NetworkManager, dispatcher, `iptables` e serviço `systemd` —
-é específica do host Linux. No Windows, as funções locais da central e o console serial podem
-ser usados sem isso; testes de rede e acesso a serviços em `10.55.0.2` dependem de o adaptador
-RNDIS do Windows ter a configuração IP/rota apropriada. O servidor web continua restrito a
-`127.0.0.1` e não deve ser exposto diretamente à rede.
+Depois que `run_windows.bat` estiver aberto e o telefone aparecer conectado na tela da Malta
+Desktop, dê duplo clique em **`setup_windows_network.bat`**. O script solicita elevação UAC
+e configura a interface RNDIS do próprio Windows:
+
+- IP estático do PC `10.55.0.1/24`, sem gateway padrão nessa interface;
+- encaminhamento IPv4 na interface RNDIS;
+- NAT de saída para a sub-rede `10.55.0.0/24`, usando o cmdlet nativo `New-NetNat`;
+- detecção do adaptador RNDIS com opção de seleção se houver mais de um.
+
+O script espera o adaptador aparecer porque a central pode precisar provisionar o gadget RNDIS
+pela serial primeiro. **Mantenha a central em execução e só então execute o configurador.**
+Ele não altera adaptadores Wi-Fi/Ethernet de saída, não remove regras NAT existentes e recusa
+continuar se detectar conflito de IP/rota com outra interface.
+
+Se o Windows já estiver usando WinNAT por WSL, Docker, Hyper-V ou outra ferramenta, a criação
+do NAT pode ser rejeitada pelo próprio Windows. Nesse caso o script informa o conflito sem
+apagar a configuração existente; a conectividade NAT exige resolver esse conflito com cuidado.
+O PC precisa ter uma rota padrão e acesso à Internet para compartilhar a conexão. Após configurar,
+volte à tela **Rede** da Malta Desktop e atualize o diagnóstico.
+
+O servidor web continua restrito a `127.0.0.1`; não o exponha diretamente à rede.
 
 ## Instalação e operação
 
@@ -553,7 +567,9 @@ static/js/views/*.js           home, files, terminal, system, network, apps, ass
                                events, settings
 tests/test_app.py              18 testes legados (serial falsa)
 tests/test_v3.py               32 testes da v3 (política, catálogo, IA, segurança)
-reverse_tether_host.sh         fallback manual do PC
+reverse_tether_host.sh         fallback manual do PC Linux
+setup_windows_network.bat      configurador RNDIS + NAT Windows
+setup_windows_network.ps1      IP 10.55.0.1 e WinNAT no adaptador RNDIS
 reverse_tether_cell.sh         fallback manual do celular (RNDIS)
 .env.example                   variáveis de ambiente, sem credenciais
 catalog.local.example.json     exemplo de catálogo local (link e serviço TCP)

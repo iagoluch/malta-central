@@ -38,7 +38,12 @@ if errorlevel 1 (
 if not defined MC_PORT set "MC_PORT=8666"
 set "MC_OPEN_BROWSER=1"
 echo [3/3] Iniciando malta-central em http://127.0.0.1:%MC_PORT%
-echo Para encerrar, pressione Ctrl+C nesta janela.
+echo.
+echo Para internet USB no celular, mantenha esta janela aberta.
+echo Quando o adaptador RNDIS aparecer, execute setup_windows_network.bat
+echo e aprove a solicitacao de Administrador do Windows.
+echo Para encerrar a central, pressione Ctrl+C nesta janela.
+echo.
 ".venv\Scripts\python.exe" app.py
 set "APP_EXIT=%ERRORLEVEL%"
 if not "%APP_EXIT%"=="0" (
