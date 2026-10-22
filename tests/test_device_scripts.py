@@ -407,6 +407,19 @@ class DeviceScriptTests(unittest.TestCase):
             size = (DEVICE / name).stat().st_size
             self.assertLess(size, limit, f"device/{name} tem {size} bytes")
 
+    def test_scripts_fit_upload_limit_with_margin(self):
+        """O cliente sobe 32.768 bytes: o script nao pode chegar perto.
+
+        O malta-desktop.sh estava com 9 bytes de folga; qualquer linha nova
+        estourava o upload do bundle. A margem aqui (32.700) deixa room
+        para o proximo ajuste sem quebrar o envio.
+        """
+        limit = 32_700
+        for name in SCRIPTS:
+            size = (DEVICE / name).stat().st_size
+            self.assertLess(size, limit,
+                            f"device/{name} tem {size} bytes (limite {limit})")
+
     def test_device_gitignore_keeps_runtime_files_out_of_the_bundle(self):
         """O bundle e versionado; o que o aparelho roda nao e.
 
@@ -675,6 +688,223 @@ class DeviceScriptTests(unittest.TestCase):
                       f"a porta livre foi vista como ocupada: {livre.stdout}")
         self.assertIn("busy=0", ocupado.stdout,
                       f"a porta ocupada nao foi vista: {ocupado.stdout}")
+
+    # -- pty do chroot (devpts, ptmx, shm) -----------------------------
+
+    def test_install_script_mounts_devpts_and_shm(self):
+        """O chroot precisa de devpts e de tmpfs em /dev/shm.
+
+        Medido no Moto E7: sem devpts o xterm falha com "get_pty: not
+        enough ptys" (errno 2). O bind do /dev do host nao traz /dev/pts:
+        o que chega no chroot e um diretorio vazio.
+        """
+        text = read_script("install.sh")
+        self.assertIn('mount -t devpts devpts "$md_dst"', text)
+        self.assertIn('mount -t tmpfs -o mode=1777 tmpfs "$ms_dst"', text)
+        self.assertIn('mount_devpts "$CHROOT/dev/pts"', text)
+        self.assertIn('mount_shm "$CHROOT/dev/shm"', text)
+        # O bind antigo nao resolvia: o host pode nao ter devpts montado.
+        self.assertNotIn("mount_pseudo /dev/pts", text)
+        self.assertNotIn("mount_pseudo /dev/shm", text)
+
+    def test_install_script_creates_the_ptmx_symlink(self):
+        """O mknod do /dev nao cria o /dev/ptmx: no Linux ele e symlink.
+
+        Sem o symlink para pts/ptmx o xterm do chroot nao abre pty.
+        """
+        text = read_script("install.sh")
+        self.assertIn('ln -sf pts/ptmx "$CHROOT/dev/ptmx"', text)
+        self.assertIn("ensure_ptmx", text)
+
+    def test_the_install_does_not_fail_when_the_kernel_has_no_devpts(self):
+        """Kernel sem devpts: o instalador avisa e segue (o doctor acusa)."""
+        text = read_script("install.sh")
+        for chamada in ('mount_devpts "$CHROOT/dev/pts"',
+                        'mount_shm "$CHROOT/dev/shm"',
+                        "ensure_ptmx"):
+            linhas = [linha for linha in text.splitlines() if chamada in linha]
+            self.assertTrue(linhas, f"install.sh sem {chamada}")
+            for linha in linhas:
+                self.assertNotIn("fail", linha,
+                                 f"install.sh aborta em {chamada}: {linha}")
+
+    def test_start_guarantees_the_terminal_environment(self):
+        """O start refaz as montagens: o chroot pode ter sido desmontado.
+
+        E o start (nao so o install) que garante /dev/pts, /dev/shm e o
+        symlink ptmx no chroot.
+        """
+        texto = read_script("malta-desktop.sh")
+        start = shell_block(texto, "cmd_start")
+        self.assertIn("ensure_mounts", start)
+        bloco = shell_block(texto, "ensure_mounts")
+        self.assertIn('mount_devpts "$CHROOT/dev/pts"', bloco)
+        self.assertIn('mount_shm "$CHROOT/dev/shm"', bloco)
+        self.assertIn("ensure_ptmx", bloco)
+        # O start avisa, mas nao aborta: so o doctor acusa.
+        for chamada in ('mount_devpts "$CHROOT/dev/pts"',
+                        'mount_shm "$CHROOT/dev/shm"',
+                        "ensure_ptmx"):
+            linhas = [linha for linha in bloco.splitlines() if chamada in linha]
+            self.assertTrue(linhas, f"ensure_mounts sem {chamada}")
+            for linha in linhas:
+                self.assertNotIn("fail", linha,
+                                 f"ensure_mounts aborta em {chamada}: {linha}")
+
+    def test_doctor_checks_devpts_ptmx_and_shm(self):
+        """O doctor e a ferramenta de diagnostico: precisa das tres pecas."""
+        doctor = shell_block(read_script("malta-desktop.sh"), "cmd_doctor")
+        for nome in ("devpts", "ptmx", "shm"):
+            self.assertIn(f"dr_pass {nome}", doctor)
+            self.assertIn(f"dr_fail {nome}", doctor)
+
+    def test_removal_unmounts_the_terminal_mounts_before_dev(self):
+        """A remocao desmonta as submontagens do /dev antes do /dev."""
+        bloco = shell_block(read_script("install.sh"), "remove_base")
+        i_pts = bloco.index('umount_if_mounted "$CHROOT/dev/pts"')
+        i_shm = bloco.index('umount_if_mounted "$CHROOT/dev/shm"')
+        i_dev = bloco.index('umount_if_mounted "$CHROOT/dev"')
+        self.assertLess(i_pts, i_dev)
+        self.assertLess(i_shm, i_dev)
+
+    def test_the_terminal_environment_cannot_disappear_again(self):
+        """Guarda de regressao do caso real (Moto E7).
+
+        O xterm do chroot falhava com "get_pty: not enough ptys" porque o
+        devpts nao estava montado e o symlink ptmx nao existia. Se alguem
+        tirar a montagem de devpts ou o symlink ptmx de um dos scripts, o
+        terminal volta a nao abrir: este teste e o que pegou a regressao.
+        """
+        for name in ("install.sh", "malta-desktop.sh"):
+            text = read_script(name)
+            self.assertIn('mount -t devpts devpts "$md_dst"', text,
+                          f"device/{name} sem montagem de devpts")
+            self.assertIn('mount -t tmpfs -o mode=1777 tmpfs "$ms_dst"', text,
+                          f"device/{name} sem tmpfs em /dev/shm")
+            self.assertIn('ln -sf pts/ptmx "$CHROOT/dev/ptmx"', text,
+                          f"device/{name} sem o symlink ptmx")
+            self.assertIn('mount_devpts "$CHROOT/dev/pts"', text,
+                          f"device/{name} sem a chamada de devpts")
+            self.assertIn('mount_shm "$CHROOT/dev/shm"', text,
+                          f"device/{name} sem a chamada de tmpfs")
+
+    @unittest.skipUnless(BASH, "bash nao encontrado nesta maquina")
+    def test_ptmx_symlink_is_created_for_real(self):
+        """A criacao do symlink roda de verdade e aponta para pts/ptmx.
+
+        O stub do ln registra a invocacao: no Windows sem privilegio de
+        symlink o MSYS copia o arquivo em vez de criar o link. Onde o
+        sistema deixa criar symlink, o link e conferido de verdade.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            (root / "dev" / "pts").mkdir(parents=True)
+            registro = base / "ln.log"
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "ln").write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >>"{msys_path(registro)}"\n'
+                '/usr/bin/ln "$@" 2>/dev/null || /bin/ln "$@" 2>/dev/null || true\n'
+                "exit 0\n", encoding="utf-8", newline="\n")
+            corpo = shell_functions(read_script("install.sh"), ("ensure_ptmx",))
+            # O ln real fica de fora do caminho: o stub registra a invocacao
+            # e delega ao ln do sistema (que cria o symlink de verdade).
+            corpo = corpo.replace("ln -sf pts/ptmx",
+                                  f'"{msys_path(bin_dir / "ln")}" -sf pts/ptmx')
+            script = base / "ptmx.sh"
+            script.write_text(
+                "set -u\n"
+                f'CHROOT="{msys_path(root)}"\n'
+                f'LOG="{msys_path(base / "log")}"\n'
+                f"{corpo}\n"
+                "ensure_ptmx\n"
+                "echo rc=$?\n"
+                "ensure_ptmx\n"
+                "echo rc2=$?\n",
+                encoding="utf-8", newline="\n")
+            resultado = subprocess.run(
+                [BASH, script.as_posix()], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60)
+            chamadas = (registro.read_text(encoding="utf-8").splitlines()
+                        if registro.exists() else [])
+            link = root / "dev" / "ptmx"
+            link_real = link.is_symlink()
+            alvo = os.readlink(link) if link_real else ""
+        saida = resultado.stdout
+        self.assertIn("rc=0", saida, f"o symlink nao foi criado: {saida}")
+        self.assertIn("rc2=0", saida, f"o symlink nao e idempotente: {saida}")
+        self.assertTrue(chamadas, f"o ensure_ptmx nao chamou o ln: {saida}")
+        for chamada in chamadas:
+            self.assertIn("-sf pts/ptmx", chamada,
+                          f"o symlink nao aponta para pts/ptmx: {chamada}")
+            self.assertTrue(chamada.endswith(msys_path(link)),
+                            f"o symlink foi criado no lugar errado: {chamada}")
+        if link_real:
+            self.assertEqual(alvo, "pts/ptmx",
+                             f"o symlink aponta para outro lugar: {alvo}")
+
+    @unittest.skipUnless(BASH, "bash nao encontrado nesta maquina")
+    def test_mount_helpers_only_mount_when_needed(self):
+        """Idempotencia: ja montado, o helper nao monta de novo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+            registro = base / "mount.log"
+            (bin_dir / "mount").write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >>"{msys_path(registro)}"\n'
+                "exit 0\n", encoding="utf-8", newline="\n")
+            mounts = base / "mounts"
+            destino = base / "root" / "dev" / "pts"
+            destino.mkdir(parents=True)
+            corpo = shell_functions(read_script("malta-desktop.sh"),
+                                    ("mount_devpts", "mount_shm"))
+            corpo = corpo.replace("/proc/mounts", msys_path(mounts))
+            corpo = corpo.replace("mount -t devpts devpts",
+                                  f'"{msys_path(bin_dir / "mount")}" -t devpts devpts')
+            script = base / "mount.sh"
+            script.write_text(
+                "set -u\n"
+                f'LOG="{msys_path(base / "log")}"\n'
+                f"{corpo}\n"
+                'mount_devpts "$1"\n'
+                "echo rc=$?\n",
+                encoding="utf-8", newline="\n")
+            destino_msys = msys_path(destino)
+
+            mounts.write_text("", encoding="utf-8")
+            subprocess.run([BASH, script.as_posix(), destino_msys], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=60)
+            primeira = registro.read_text(encoding="utf-8") if registro.exists() else ""
+            self.assertIn("devpts", primeira,
+                          f"o devpts nao foi montado: {primeira!r}")
+
+            registro.write_text("", encoding="utf-8")
+            mounts.write_text(f"devpts {destino_msys} devpts rw 0 0\n",
+                              encoding="utf-8")
+            segunda = subprocess.run(
+                [BASH, script.as_posix(), destino_msys], capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=60)
+            repetida = registro.read_text(encoding="utf-8") if registro.exists() else ""
+            self.assertEqual(repetida, "",
+                             f"o devpts foi montado de novo: {repetida!r}")
+            self.assertIn("rc=0", segunda.stdout,
+                          f"o helper falhou com a montagem ja feita: {segunda.stdout}")
+
+    @unittest.skipUnless(BASH, "bash nao encontrado nesta maquina")
+    def test_doctor_fails_when_the_terminal_environment_is_missing(self):
+        """Sem devpts/ptmx/shm no chroot, o doctor acusa cada peca."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fake_installed_root(base)
+            output = run_device("doctor", base)
+        for nome in ("devpts", "ptmx", "shm"):
+            self.assertIn(f"FAIL {nome}", output,
+                          f"o doctor nao acusou {nome}: {output}")
 
     # -- session.sh -----------------------------------------------------
 

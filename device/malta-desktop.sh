@@ -2,39 +2,31 @@
 # Controle do Malta Desktop no aparelho (Alpine armv7, root).
 #
 # Sobe o Xvnc em :1 escutando direto na interface USB (10.55.0.2:5901) e
-# mantém a sessão X (openbox, tint2, pcmanfm) dentro do chroot em
-# /data/malta-desktop/root.
+# mantém a sessão X (openbox, tint2, pcmanfm) no chroot /data/malta-desktop/root.
 #
 # O Xvnc usa -interface $RNDIS_IP, e nao -localhost: neste aparelho (TigerVNC
-# 1.16) o -localhost (createLocalTcpListeners) nao devolve endereco/porta e o
-# Xvnc aborta com "No path or port configured for incoming connections"; com
-# -interface (createTcpListeners) o mesmo Xvnc sobe em 10.55.0.2:5901. Sem
-# proxy: o VNC fica preso a interface USB.
+# 1.16) o -localhost aborta com "No path or port configured for incoming
+# connections". Sem proxy: o VNC fica preso a interface USB.
 #
-# Os processos nascem dentro do chroot; o chroot faz exec, então a linha de
-# comando não carrega o prefixo do caminho. A identificação usa
-# /proc/<pid>/root comparado com $CHROOT, nunca "pkill -f $CHROOT/...".
+# Os processos nascem dentro do chroot; a identificação usa /proc/<pid>/root
+# comparado com $CHROOT, nunca "pkill -f $CHROOT/...".
 #
-# start, restart, stop, status, measure e doctor imprimem chaves KEY=VALOR,
-# que é o contrato lido pelo app via /api/cmd. O estado persistido fica em
+# start, restart, stop, status, measure e doctor imprimem chaves KEY=VALOR
+# (contrato lido pelo app via /api/cmd); o estado persistido fica em
 # /data/malta-desktop/run/desktop.status (STATE/TS/ERROR).
 #
 # Contrato do status: STATE ∈ {stopped, starting, running, degraded, error};
-# INSTALLED, X_READY, DATA e RNDIS são booleanos 1|0. A ausencia do desktop e
-# dita por INSTALLED=0 (com STATE=stopped). SOCAT_PID continua no contrato e
-# vale sempre 0 (nao ha proxy); o PC ainda exige SOCAT_PID != 0 na prontidao.
+# INSTALLED, X_READY, DATA e RNDIS são booleanos 1|0. SOCAT_PID continua no
+# contrato e vale sempre 0 (nao ha proxy).
 #
 # Contrato da versão: VERSION é o md5 do install.sh instalado (gravado em
-# /data/malta-desktop/version). O PC compara com o md5 do device/install.sh
-# local e reinstala quando divergem.
+# /data/malta-desktop/version); o PC compara e reinstala quando divergem.
 #
 # Contrato do measure: uma linha "PROC=<nome> RSS_KB=<n> PSS_KB=<n>" por
-# processo do desktop (Xvnc, openbox, tint2, pcmanfm, xterm); processo que
-# não existe não imprime linha.
+# processo do desktop; processo que não existe não imprime linha.
 #
 # A senha VNC fica em /data/malta-desktop/vncpasswd (8 bytes, VncAuth) e é
-# sincronizada para /root/.vnc/passwd do chroot a cada start, porque o chroot
-# não enxerga /data/malta-desktop diretamente.
+# sincronizada para /root/.vnc/passwd do chroot a cada start.
 #
 # O menu de aplicativos é o jgmenu (painel e Alt+F2); o menu do openbox
 # (menu.xml) é aberto por Alt+F1 — o clique direito não chega ao openbox,
@@ -42,9 +34,8 @@
 
 set -u
 
-# Base do bundle no aparelho. O app sempre usa /data/malta-desktop; a variavel
-# de ambiente existe para os testes montarem uma raiz falsa e exercitarem o
-# script sem o aparelho.
+# Base do bundle no aparelho (a variavel de ambiente deixa os testes
+# montarem uma raiz falsa).
 BASE=${MALTA_DESKTOP_BASE:-/data/malta-desktop}
 CHROOT=$BASE/root
 RUN=$BASE/run
@@ -59,8 +50,7 @@ BASELINE=$RUN/mem.baseline
 VNC_PASSWD_SRC=$BASE/vncpasswd
 VNC_PASSWD_DST=$CHROOT/root/.vnc/passwd
 
-# Resolução única da sessão; a geometria e a profundidade são derivadas para
-# não haver dois valores divergentes.
+# Resolução única da sessão (geometria e profundidade derivadas).
 RESOLUTION=1024x600x16
 X_GEOMETRY=${RESOLUTION%x*}
 X_DEPTH=${RESOLUTION##*x}
@@ -70,17 +60,14 @@ RNDIS_IP=10.55.0.2
 VNC_PORT=5901
 X_WAIT=8
 XSET_TIMEOUT=5
-# Argumentos do Xvnc: ele escuta direto na interface USB (-interface), e nao
-# em loopback (-localhost aborta neste aparelho).
+# Argumentos do Xvnc: escuta na interface USB (-interface), nao em loopback.
 XVNC_ARGS="-geometry $X_GEOMETRY -depth $X_DEPTH -rfbport $VNC_PORT -rfbauth /root/.vnc/passwd -SecurityTypes VncAuth -interface $RNDIS_IP"
 STOP_WAIT=3
 SESSION_WAIT=5
 MIN_FREE_KB=20480
 
-# Vocabulario de STATE do contrato com o app (malta_desktop_core.py):
-#   stopped  - desktop parado          starting - start em andamento
-#   running  - X, VNC e sessao no ar   degraded - componentes parciais
-#   error    - erro persistido em run/desktop.status
+# Vocabulario de STATE do contrato (malta_desktop_core.py): stopped,
+# starting, running, degraded e error (erro persistido em desktop.status).
 ST_STOPPED=stopped
 ST_STARTING=starting
 ST_RUNNING=running
@@ -95,10 +82,9 @@ BOOL_OFF=0
 HOME=/root
 export HOME
 
-# Padrões de linha de comando aceitos: só processos com /proc/<pid>/root igual
-# a $CHROOT e cmdline que caia num destes padrões. A lista é separada por
-# ESPAÇO e percorrida padrão a padrão (um "|" não vira alternância do case).
-# O socat fica na lista para o stop derrubar o proxy do bundle antigo.
+# Padrões de cmdline aceitos: a lista é separada por ESPAÇO e percorrida
+# padrão a padrão (um "|" não vira alternância do case). O socat fica na
+# lista para o stop derrubar o proxy do bundle antigo.
 DESKTOP_PATTERNS='/usr/bin/Xvnc* /usr/bin/socat* *malta-session* /usr/bin/openbox* /usr/bin/tint2* /usr/bin/pcmanfm* /usr/bin/xterm* /usr/bin/xsetroot* /usr/bin/setxkbmap* /usr/bin/xkbcomp*'
 
 REQUIRED_BINS="/usr/bin/Xvnc /usr/local/bin/malta-session /usr/bin/openbox /usr/bin/tint2 /usr/bin/pcmanfm /usr/bin/xterm /usr/bin/jgmenu_run"
@@ -190,8 +176,7 @@ release_lock() {
     return 0
 }
 
-# Lock por diretório: mkdir é atômico. Um lock de processo morto é removido e
-# a tentativa seguinte recria; 5 voltas cobrem a corrida entre dois comandos.
+# Lock por diretório: mkdir é atômico; lock de processo morto é removido.
 acquire_lock() {
     al_i=0
     while [ "$al_i" -lt 5 ]; do
@@ -217,8 +202,7 @@ pid_alive() {
         ''|*[!0-9]*) return 1 ;;
     esac
     [ -r "/proc/$1/stat" ] || return 1
-    # O campo "state" vem depois do nome do processo: o "read" do shell evita
-    # um processo extra por consulta.
+    # O "read" do shell evita um processo extra por consulta.
     pa_line=
     read -r pa_line <"/proc/$1/stat" 2>/dev/null
     [ -n "$pa_line" ] || return 1
@@ -235,8 +219,7 @@ pid_cmdline() {
     tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null
 }
 
-# Casa o cmdline do processo com a lista de padrões (mesma regra do
-# scan_pids: um padrão por vez, sem alternância do case).
+# Casa o cmdline com a lista de padrões (mesma regra do scan_pids).
 pid_matches() {
     pm_cmd=$(pid_cmdline "$1")
     [ -n "$pm_cmd" ] || return 1
@@ -250,9 +233,7 @@ pid_matches() {
     return 1
 }
 
-# Cache da varredura de /proc: um único passe por invocação (status e measure
-# consultam os mesmos processos várias vezes). Invalidado quando o script cria
-# ou encerra algo.
+# Cache da varredura de /proc: um único passe por invocação.
 SCAN_CACHE=
 SCAN_READY=0
 
@@ -272,9 +253,8 @@ scan_all() {
 }
 
 # Varredura sem /proc/<pid>/cmdline prefixado: só casa o que está no chroot.
-# "set -f" durante o laço: os curingas da lista são padrões do case, não nomes
-# de arquivo (sem isso "/usr/bin/socat*" seria expandido contra o diretório
-# atual e o processo ficaria de fora da lista).
+# "set -f" no laço: os curingas da lista são padrões do case, não nomes de
+# arquivo (sem isso "/usr/bin/socat*" seria expandido e sumiria da lista).
 scan_pids() {
     scan_all
     set -f
@@ -310,8 +290,7 @@ component_pid() {
 }
 
 # Descobre o pid real do Xvnc: o setsid faz fork quando o processo é líder de
-# grupo (o shell do console é interativo) e o "$!" do spawn é o pid do pai,
-# que sai na hora. Quem vale é o processo do /proc.
+# grupo, e o "$!" do spawn é o pid do pai, que sai na hora.
 xvnc_pid() {
     xp_fallback=${1:-}
     xp_try=0
@@ -358,17 +337,47 @@ mount_if_needed() {
     mount -o bind "$1" "$mi_dst" >>"$LOG" 2>&1
 }
 
+# devpts: instancia nova de pseudoterminais no chroot. O bind do /dev do host
+# nao traz /dev/pts (sem devpts no host, traz um diretorio vazio) e o xterm
+# falha com "get_pty: not enough ptys".
+mount_devpts() {
+    md_dst=$1
+    grep -qs " $md_dst " /proc/mounts && return 0
+    mkdir -p "$md_dst" || return 1
+    mount -t devpts devpts "$md_dst" >>"$LOG" 2>&1
+}
+
+# tmpfs em /dev/shm: e onde o X coloca a memoria compartilhada.
+mount_shm() {
+    ms_dst=$1
+    grep -qs " $ms_dst " /proc/mounts && return 0
+    mkdir -p "$ms_dst" || return 1
+    mount -t tmpfs -o mode=1777 tmpfs "$ms_dst" >>"$LOG" 2>&1
+}
+
+# /dev/ptmx e um symlink para pts/ptmx: o mknod do /dev nao o cria, e sem ele
+# o xterm nao abre pty nenhum.
+ensure_ptmx() {
+    if [ -L "$CHROOT/dev/ptmx" ] && [ "$(readlink "$CHROOT/dev/ptmx")" = "pts/ptmx" ]; then
+        return 0
+    fi
+    ln -sf pts/ptmx "$CHROOT/dev/ptmx" >>"$LOG" 2>&1
+}
+
 ensure_mounts() {
     mount_if_needed /proc "$CHROOT/proc" || fail "não foi possível montar /proc em $CHROOT/proc"
     mount_if_needed /dev "$CHROOT/dev" || fail "não foi possível montar /dev em $CHROOT/dev"
     mount_if_needed /sys "$CHROOT/sys" || fail "não foi possível montar /sys em $CHROOT/sys"
     # /dev/pts e /dev/shm são montagens separadas: um bind de /dev não as traz
     # junto, e sem elas o xterm do painel não abre um pty ("not enough ptys")
-    # e o X perde o transporte de memoria compartilhada.
-    mount_if_needed /dev/pts "$CHROOT/dev/pts" ||
-        fail "não foi possível montar /dev/pts em $CHROOT/dev/pts"
-    mount_if_needed /dev/shm "$CHROOT/dev/shm" ||
-        fail "não foi possível montar /dev/shm em $CHROOT/dev/shm"
+    # e o X perde o transporte de memória compartilhada. Kernel sem devpts não
+    # aborta o start: o aviso fica no log e o doctor acusa (FAIL devpts).
+    mount_devpts "$CHROOT/dev/pts" ||
+        say "aviso: devpts não montado em $CHROOT/dev/pts; o terminal pode não abrir"
+    mount_shm "$CHROOT/dev/shm" ||
+        say "aviso: tmpfs não montado em $CHROOT/dev/shm"
+    ensure_ptmx ||
+        say "aviso: symlink $CHROOT/dev/ptmx -> pts/ptmx não criado"
 }
 
 cleanup_x_socket() {
@@ -389,16 +398,14 @@ sync_vncpasswd() {
 x_ready() {
     xr_wait=${1:-$XSET_TIMEOUT}
     [ "$xr_wait" -gt "$XSET_TIMEOUT" ] && xr_wait=$XSET_TIMEOUT
-    # O xset sem prazo trava a serial: com um socket X obsoleto (servidor
-    # morto) ele bloqueia por minutos e o console fica ocupado. O timeout
-    # corta a espera; saida != 0 = "o X nao responde".
+    # O xset sem prazo trava a serial (socket X obsoleto bloqueia por
+    # minutos). O timeout corta a espera; saida != 0 = "o X nao responde".
     timeout "$xr_wait" chroot "$CHROOT" /usr/bin/xset -display "$DISPLAY_NUM" q \
         >/dev/null 2>&1
 }
 
 # Espera o X responder por xset, no máximo X_WAIT segundos. Se o Xvnc morrer,
-# devolve 1 na hora para o chamador decidir o retry. Cada tentativa consome
-# no máximo o que sobra do X_WAIT.
+# devolve 1 na hora para o chamador decidir o retry.
 wait_x() {
     wx_pid=${1:-}
     wx_end=$(( $(now) + X_WAIT ))
@@ -411,8 +418,7 @@ wait_x() {
     done
 }
 
-# A porta 5901 ocupada: o desktop anterior não foi encerrado. Subir um Xvnc
-# nessa situação falha de forma obscura ("address already in use").
+# A porta 5901 ocupada: o desktop anterior não foi encerrado.
 vnc_port_busy() {
     tcp_listening "$RNDIS_IP" "$VNC_PORT" && return 0
     tcp_listening "127.0.0.1" "$VNC_PORT" && return 0
@@ -457,7 +463,7 @@ session_pid() {
 }
 
 # A sessão publica os PIDs em /tmp/malta-session.pids; o pcmanfm é o marco de
-# "desktop pronto". Se a sessão morrer, start falha; se demorar, avisa e segue.
+# "desktop pronto".
 wait_session() {
     ws_pid=$1
     ws_end=$(( $(now) + SESSION_WAIT ))
@@ -554,9 +560,7 @@ stop_components() {
     for sc_pid in $sc_left; do
         pid_alive "$sc_pid" && sc_live="$sc_live $sc_pid"
     done
-    # O stop é a garantia de que nenhum processo do desktop fica órfão. O
-    # Xvnc é conferido primeiro: é ele que segura a porta 5901 e faz o
-    # próximo start falhar de forma obscura.
+    # O stop é a garantia de que nenhum processo do desktop fica órfão.
     SCAN_READY=0
     sx_left=
     for sx_pid in $(scan_pids '/usr/bin/Xvnc*'); do
@@ -635,8 +639,7 @@ cmd_status() {
     st_persisted=$(status_field STATE)
     st_perr=$(status_field ERROR)
     if [ "$st_installed" != "$BOOL_ON" ]; then
-        # Sem o desktop instalado o estado e "stopped": a ausencia e dita por
-        # INSTALLED=0, nao por um estado novo no vocabulario.
+        # Sem o desktop instalado o estado e "stopped" (INSTALLED=0).
         st_state=$ST_STOPPED
         st_err=
     elif [ "$st_persisted" = "$ST_ERROR" ]; then
@@ -650,14 +653,12 @@ cmd_status() {
         st_state=$ST_STOPPED
         st_err=
     else
-        # Componentes parciais: o app le "degraded", que e o estado parcial.
-        # ERROR fica vazio de proposito: no PC um ERROR preenchido vira a
-        # fase "error" e esconde o "degraded".
+        # Componentes parciais: o app le "degraded". ERROR fica vazio de
+        # proposito: um ERROR preenchido vira a fase "error" no PC.
         st_state=$ST_DEGRADED
         st_err=
     fi
-    # A versao do bundle e o md5 do install.sh instalado (32 hex). O valor do
-    # arquivo e repassado como esta: o PC compara com o bundle local e trata
+    # A versao do bundle e o md5 do install.sh instalado (32 hex); o PC trata
     # o formato numerico antigo como divergencia (reinstalar).
     st_version=0
     if [ -f "$BASE/version" ]; then
@@ -671,8 +672,7 @@ cmd_status() {
     printf 'DATA=%s\n' "$st_data"
     printf 'RNDIS=%s\n' "$st_rndis"
     printf 'XVNC_PID=%s\n' "$st_xvnc"
-    # O proxy saiu: o Xvnc escuta direto na interface USB. A chave continua
-    # no contrato (o PC a le) e vale sempre 0.
+    # O proxy saiu: a chave continua no contrato e vale sempre 0.
     printf 'SOCAT_PID=0\n'
     printf 'X_READY=%s\n' "$st_xready"
     printf 'GEOMETRY=%s\n' "$X_GEOMETRY"
@@ -680,15 +680,13 @@ cmd_status() {
     printf 'ERROR=%s\n' "$st_err"
 }
 
-# Memoria dos processos: lida uma vez por PID e guardada em cache ("pid:rss:pss"
-# por processo). O measure roda no limite de 15 s do /api/cmd e o smaps de um
-# processo custa segundos no aparelho (kernel 4.9 sem smaps_rollup).
+# Memoria dos processos: lida uma vez por PID e guardada em cache
+# ("pid:rss:pss"). O smaps custa segundos no aparelho (kernel 4.9).
 MEM_CACHE=
 PM_RSS=0
 PM_PSS=0
 
-# Le o smaps de um processo e soma o PSS (KB): o smaps_rollup e preferido (uma
-# linha so); no smaps completo, soma as linhas "Pss:".
+# Le o smaps e soma o PSS (KB): o smaps_rollup e preferido (uma linha so).
 read_smaps_pss() {
     rp_pid=$1
     if [ -r "/proc/$rp_pid/smaps_rollup" ]; then
@@ -724,10 +722,8 @@ read_status_rss() {
     return 0
 }
 
-# RSS e PSS de um processo, lidos uma unica vez por PID (o cache vem primeiro:
-# o segundo pedido do mesmo PID sai de memoria). Devolve 1 quando o processo
-# nao existe: quem chama omite a linha em vez de reportar 0 KB. O cache vive
-# no shell: um subshell perderia o cache.
+# RSS e PSS de um processo, lidos uma unica vez por PID (o cache vive no
+# shell: um subshell perderia o cache).
 mem_proc_kb() {
     mp_pid=${1:-}
     case "$mp_pid" in
@@ -752,8 +748,7 @@ mem_proc_kb() {
     return 0
 }
 
-# PID de um componente publicado pela sessao em $CHROOT/tmp/malta-session.pids
-# (chaves session=, openbox=, tint2=, pcmanfm= e desktop=).
+# PID de um componente publicado pela sessao em malta-session.pids.
 session_pid_field() {
     spf_val=
     while IFS= read -r spf_line; do
@@ -764,8 +759,7 @@ session_pid_field() {
     printf '%s\n' "$spf_val"
 }
 
-# Uma linha por processo do desktop: o app mostra o nome direto na tela.
-# Processo ausente nao emite linha (0 seria lido como processo de 0 KB).
+# Uma linha por processo do desktop; processo ausente nao emite linha.
 emit_proc() {
     ep_name=$1
     ep_pid=$2
@@ -814,8 +808,7 @@ cmd_measure() {
     esac
     mm_delta=$((mm_base - mm_avail))
     [ "$mm_delta" -lt 0 ] && mm_delta=0
-    # Memoria de cada processo: uma leitura por PID, no shell do comando (um
-    # subshell perderia o cache).
+    # Memoria de cada processo: uma leitura por PID, no shell do comando.
     mm_xvnc_rss=0
     mm_xvnc_pss=0
     mm_sess_rss=0
@@ -935,6 +928,27 @@ cmd_doctor() {
         dr_fail mounts "não montados:$dr_mounts"
     fi
 
+    # As tres pecas do terminal: sem devpts o xterm nao abre pty ("not enough
+    # ptys"), sem o symlink ptmx o mesmo xterm falha, e sem shm o X perde a
+    # memoria compartilhada.
+    if grep -qs " $CHROOT/dev/pts devpts " /proc/mounts; then
+        dr_pass devpts
+    else
+        dr_fail devpts "devpts não montado em $CHROOT/dev/pts"
+    fi
+
+    if [ -L "$CHROOT/dev/ptmx" ] && [ "$(readlink "$CHROOT/dev/ptmx")" = "pts/ptmx" ]; then
+        dr_pass ptmx
+    else
+        dr_fail ptmx "symlink ausente ou errado: $CHROOT/dev/ptmx -> pts/ptmx"
+    fi
+
+    if grep -qs " $CHROOT/dev/shm tmpfs " /proc/mounts; then
+        dr_pass shm
+    else
+        dr_fail shm "tmpfs não montado em $CHROOT/dev/shm"
+    fi
+
     dr_free=$(df -Pk "$BASE" 2>/dev/null | awk 'NR==2 {print $4}')
     case "$dr_free" in
         ''|*[!0-9]*) dr_free=0 ;;
@@ -964,8 +978,7 @@ cmd_doctor() {
         dr_fail x "$DISPLAY_NUM não responde a xset"
     fi
 
-    # O VNC e o proprio Xvnc, escutando na interface USB: nao ha proxy no
-    # meio. O teste e a porta 5901 escutando em $RNDIS_IP.
+    # O VNC e o proprio Xvnc: o teste e a porta 5901 em $RNDIS_IP.
     if tcp_listening "$RNDIS_IP" "$VNC_PORT"; then
         dr_pass vnc
     else
@@ -981,8 +994,7 @@ cmd_doctor() {
 
     dr_version=
     [ -f "$BASE/version" ] && dr_version=$(head -n 1 "$BASE/version" 2>/dev/null)
-    # A versao do bundle e o md5 do install.sh instalado: 32 hex. O formato
-    # numerico antigo (1) e invalido: o bundle esta desatualizado.
+    # A versao do bundle e o md5 do install.sh instalado: 32 hex.
     case "$dr_version" in
         *[!0-9a-f]*) dr_version= ;;
     esac

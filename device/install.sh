@@ -146,6 +146,37 @@ mount_pseudo() {
     mount -o bind "$src" "$dst" >>"$LOG" 2>&1
 }
 
+# devpts: instancia nova de pseudoterminais dentro do chroot. O bind do /dev
+# do host nao traz /dev/pts (e, sem devpts no host, traz so um diretorio
+# vazio): o xterm falha com "get_pty: not enough ptys".
+mount_devpts() {
+    md_dst=$1
+    if grep -qs " $md_dst " /proc/mounts; then
+        return 0
+    fi
+    mkdir -p "$md_dst" || return 1
+    mount -t devpts devpts "$md_dst" >>"$LOG" 2>&1
+}
+
+# tmpfs em /dev/shm: e onde o X coloca a memoria compartilhada.
+mount_shm() {
+    ms_dst=$1
+    if grep -qs " $ms_dst " /proc/mounts; then
+        return 0
+    fi
+    mkdir -p "$ms_dst" || return 1
+    mount -t tmpfs -o mode=1777 tmpfs "$ms_dst" >>"$LOG" 2>&1
+}
+
+# /dev/ptmx e um symlink para pts/ptmx: o mknod do /dev nao o cria. Sem ele
+# o xterm do chroot nao abre pty nenhum ("get_pty: not enough ptys").
+ensure_ptmx() {
+    if [ -L "$CHROOT/dev/ptmx" ] && [ "$(readlink "$CHROOT/dev/ptmx")" = "pts/ptmx" ]; then
+        return 0
+    fi
+    ln -sf pts/ptmx "$CHROOT/dev/ptmx" >>"$LOG" 2>&1
+}
+
 umount_if_mounted() {
     if grep -qs " $1 " /proc/mounts; then
         umount "$1" >>"$LOG" 2>&1 || return 1
@@ -330,9 +361,14 @@ mount_pseudo /proc "$CHROOT/proc" || fail "não foi possível montar /proc em $C
 mount_pseudo /dev "$CHROOT/dev" || fail "não foi possível montar /dev em $CHROOT/dev"
 mount_pseudo /sys "$CHROOT/sys" || fail "não foi possível montar /sys em $CHROOT/sys"
 # /dev/pts e /dev/shm são montagens próprias: o bind de /dev não as traz
-# junto. Sem /dev/pts o xterm do chroot falha com "not enough ptys".
-mount_pseudo /dev/pts "$CHROOT/dev/pts" || fail "não foi possível montar /dev/pts em $CHROOT/dev/pts"
-mount_pseudo /dev/shm "$CHROOT/dev/shm" || fail "não foi possível montar /dev/shm em $CHROOT/dev/shm"
+# junto. Sem /dev/pts o xterm do chroot falha com "get_pty: not enough ptys".
+# Kernel sem devpts não impede a instalação: o doctor acusa depois.
+mount_devpts "$CHROOT/dev/pts" ||
+    say "aviso: não foi possível montar devpts em $CHROOT/dev/pts; o terminal pode não abrir"
+mount_shm "$CHROOT/dev/shm" ||
+    say "aviso: não foi possível montar tmpfs em $CHROOT/dev/shm"
+ensure_ptmx ||
+    say "aviso: não foi possível criar o symlink $CHROOT/dev/ptmx -> pts/ptmx"
 
 if [ -r /etc/resolv.conf ]; then
     cp /etc/resolv.conf "$CHROOT/etc/resolv.conf" 2>/dev/null || say "aviso: não foi possível copiar /etc/resolv.conf"
